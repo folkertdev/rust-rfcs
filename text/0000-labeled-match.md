@@ -8,7 +8,7 @@
 
 This RFC adds labeled match: a `match` can be labelled, and be targeted by a `continue` that takes a single operand. This value is treated as a replacement operand to the `match` expression.
 
-Semantically, this construct is similar to a `match` inside of a loop, with a mutable variable being updated to move to the next state. For instance, these two functions are equivalent:
+This construct is similar to a `match` inside of a loop, with a mutable variable being updated to move to the next state. For instance, these two functions are semantically equivalent:
 
 ```rust
 fn labeled_switch() -> Option<u8> {
@@ -56,15 +56,15 @@ loop {
 }
 ```
 
-While this is a natural way to express a state machine, it is well-known that when translated to machine code in a naive way, this approach is inefficient on modern CPUs: the match is an unpredictable branch, causing many branch misses. Reducing the number of branch misses is crucial for good performance on modern hardware.
+While this is a natural way to express a state machine, it is well-known that when translated to machine code in a straightforward way, this approach is inefficient on modern CPUs: the match is an unpredictable branch, causing many branch misses. Reducing the number of branch misses is crucial for good performance on modern hardware.
 
-Therefore, labeled match guarantees that **when a state transition has a target known at compile time, the transition is a single unconditional jump to that target**.
-
-In some cases, the LLVM backend already achieves this optimal code generation, but the transformation is not guaranteed and fails for more complex inputs. Furthermore, LLVM is not the only rust codegen backend: it is likely that both `rustc_codegen_gcc` and `rustc_codegen_cranelift` will see more and more use. Hence we should be sceptical of relying on LLVM to achieve good codegen, and prefer performing optimization for all backends on the rustc MIR representation.
+The equivalent of the above snippet will instead perform a direct jump from the bottom of the `A` branch to the top of the `B` branch: labeled match guarantees that when a state transition has a target that is known at compile time, the transition is a single unconditional jump to that target.
 
 ### What does LLVM do?
 
-We can use LLVM as a reference point for what will already get optimized today, and where code generation is lacking.
+In some cases, the LLVM backend already achieves this optimal code generation using unconditional jumps, but the transformation is not guaranteed and fails for more complex inputs. Furthermore, LLVM is not the only rust codegen backend: it is likely that both `rustc_codegen_gcc` and `rustc_codegen_cranelift` will see more and more use. Hence we should be sceptical of relying on LLVM to achieve good codegen, and prefer performing optimization for all backends on the rustc MIR representation.
+
+Nevertheless, we can use LLVM as a reference point for what will already get optimized today, and where code generation is lacking.
 
 **targets are statically known**
 
@@ -477,6 +477,8 @@ Produces this MIR today with `--release`. Assuming the initial state is `State::
     }
 ```
 
+> NOTE: a separate MIR pass could perform jump threading, and turn the repeated jumps into a single unconditional jump. Apparently the current implementation relies on LLVM performing this analysis, and we've already seen that it is not perfect. Hence, it seems likely that a jump threading pass on MIR would similarly not cover all cases and therefore would be fragile. 
+
 The proposed labelled match code
 
 ```rust
@@ -653,25 +655,17 @@ This logic will compile down to direct jumps between basic blocks in LLVM IR.
 
 My personal opinion is that join points would be awkward in rust, given that rust has much more powerful control flow constructs already (which are not present in the functional languages listed earlier). They would also likely require new syntax/keywords. Note again that none of the listed languages expose join points to users.
 
-## Labelled match
+## Labeled match
 
-That brings us to this proposal, the labelled match.
+That brings us to this proposal, the labeled match.
 
-The labeled match proposal combines existing rust features of match and labeled blocks/loops.
+The labeled match proposal combines existing rust features of match and labeled blocks/loops. It is just the interaction between these concepts that has to be learned, no new keywords or syntactic constructions are needed.
 
-The improved code generation that is achieved is required in real programs. My own experience is with [`zlib-rs`](https://github.com/memorysafety/zlib-rs).
+Labeled match is not blocked on LLVM, and can be implemented entirely in rustc, providing benefits to all code generation backends. 
 
-**What is the impact of not doing this?**
+Labeled match does not introduce arbitrary control flow (like general `goto`) or surprising implicit control flow (like `switch` fallthrough in C and descendants).
 
-Rust code is slower than C code
-
-**could this be done in a library or macro instead?**
-
-No, because improved code generation is the entire point of this syntax
-
-**Does the proposed change make Rust code easier or harder to read, understand, and maintain?**
-
-Well it doesn't make it easier, though actual occurences will be extremely rare. Still both the compiler and tooling need to support this additional feature.
+The codegen guarantees provided by labeled are essential in real-world programs, like [`zlib-rs`](https://github.com/memorysafety/zlib-rs). The lack of such a guarantee actively limits the adoption of rust in domains performance is key. Without a feature like this, it is effectively impossible to beat C in certain cases.
 
 # Prior art
 [prior-art]: #prior-art
