@@ -14,7 +14,7 @@ Semantically, this construct is similar to a `match` inside of a loop, with a mu
 'top: match state {
     A => {
         // <perform work>
-        
+
         // transition to state B
         continue 'top B;
     }
@@ -25,12 +25,12 @@ Semantically, this construct is similar to a `match` inside of a loop, with a mu
 
 // --- is equivalent to
 
-'top: loop { 
+'top: loop {
     let mut state = state;
     match state {
         A => {
             // <perform work>
-            
+
             state = B;
             continue 'top;
         }
@@ -44,16 +44,16 @@ Semantically, this construct is similar to a `match` inside of a loop, with a mu
 # Motivation
 [motivation]: #motivation
 
-The goal of labeled match is improved codegen for state machines. 
+The goal of labeled match is improved codegen for state machines.
 
-State machines (parsers, interpreters, ect) can be written as a loop containing a match on the current state. The match picks the branch that belongs to the current state, some logic is performed, the state is updated, and eventually control flow jumps back to the top of the loop, branching to the next state. 
+State machines (parsers, interpreters, ect) can be written as a loop containing a match on the current state. The match picks the branch that belongs to the current state, some logic is performed, the state is updated, and eventually control flow jumps back to the top of the loop, branching to the next state.
 
 ```rust
-loop { 
+loop {
     match state {
         A => {
             // <perform work>
-            
+
             state = B;
         }
         B => {
@@ -88,7 +88,7 @@ enum State { S1, S2, S3 }
 #[no_mangle]
 #[rustfmt::skip]
 unsafe fn looper(mut state: State, input: &[u8]) {
-    for from in input { 
+    for from in input {
         match state {
             State::S1 => {
                 print("S1");
@@ -111,8 +111,8 @@ unsafe fn looper(mut state: State, input: &[u8]) {
                     _ => state = State::S1,
                 }
             }
-        }                                                                                                                                                                               
-    }                                                                                                                                                                                   
+        }
+    }
 }
 
 extern "Rust" {
@@ -133,8 +133,8 @@ unsafe fn looper(mut state: State, input: &[u8]) {
             State::S2 => { state = process_2(*input.get_unchecked(i)); i += 1; continue; }
             State::S3 => { state = process_3(*input.get_unchecked(i)); i += 1; continue; }
             State::S4 => { state = process_4(*input.get_unchecked(i)); i += 1; continue; }
-        }                                                                                                                                                                               
-    }                                                                                                                                                                                   
+        }
+    }
 }
 ```
 
@@ -159,11 +159,11 @@ So far LLVM generates (close to) optimal code. But rustc nor LLVM guarantee that
 
 ```rust
 #[allow(dead_code)]
-enum State { 
+enum State {
     Done,
-    S1, 
-    S2, 
-    S3, 
+    S1,
+    S2,
+    S3,
 }
 
 #[no_mangle]
@@ -172,10 +172,10 @@ unsafe fn looper(input: &[u8]) -> usize {
     let mut state = State::S1;
 
     let mut it = input.iter();
-    
+
     loop {
         match state {
-            State::S1 => { 
+            State::S1 => {
                 let Some(from) = it.next() else { state = State::Done; continue };
 
                 match from {
@@ -183,7 +183,7 @@ unsafe fn looper(input: &[u8]) -> usize {
                     _ => state = State::S2
                 }
             }
-            State::S2 => { 
+            State::S2 => {
                 let Some(from) = it.next() else { state = State::Done; continue };
 
                 match from {
@@ -191,7 +191,7 @@ unsafe fn looper(input: &[u8]) -> usize {
                     _ => state = State::S3
                 }
             }
-            State::S3 => { 
+            State::S3 => {
                 let Some(from) = it.next() else { state = State::Done; continue };
 
                 match from {
@@ -199,11 +199,11 @@ unsafe fn looper(input: &[u8]) -> usize {
                     _ => state = State::S1,
                 }
             }
-            State::Done => { 
+            State::Done => {
                 return 0;
             }
-        }                                                                                                                                                                               
-    }                                                                                                                                                                                   
+        }
+    }
 }
 ```
 
@@ -281,7 +281,7 @@ As a programmer, we have no control over this process. Adding one extra state tr
 
 **real-world use cases**
 
-This RFC follows in part from my work on [zlib-rs](https://github.com/trifectatechfoundation/zlib-rs). The decompression logic of zlib is a giant state machine. The C version relies heavily on 
+This RFC follows in part from my work on [zlib-rs](https://github.com/trifectatechfoundation/zlib-rs). The decompression logic of zlib is a giant state machine. The C version relies heavily on
 
 - putting values onto the stack (rather than behind a heap-allocated pointer). In practice, LLVM is a lot better at reasoning about stack values, resulting in better optimizations
 - guaranteed direct jumps between different states, using the fallthrough behavior of C `switch` statements
@@ -308,7 +308,7 @@ Just like loops, a `match` can be annotated with a label. This label makes the m
 
 ```rust
 fn labeled_switch() -> Option<u8> {
-    'foo: match 1u8 { 
+    'foo: match 1u8 {
         1 => continue 'foo 2,
         2 => continue 'foo 3,
         3 => break 'foo Some(42),
@@ -337,9 +337,9 @@ These functions differ in two ways:
 A straightforward lowering of `emulate_labeled_switch` to machine code would produce inefficient code, because the `match` is an [unpredictable branch](https://en.wikipedia.org/wiki/Branch_predictor). Labeled match guarantees that when the target match branch of a `continue` is known:
 
 - at compiletime, an unconditional jump is generated
-- only at runtime, a jump table is generated 
+- only at runtime, a jump table is generated
 
-Direct, unconditional jumps do not need to be predicted, and jump tables are also easier on the branch predictor than more basic code generation approaches. The result is faster programs. 
+Direct, unconditional jumps do not need to be predicted, and jump tables are also easier on the branch predictor than more basic code generation approaches. The result is faster programs.
 
 # Reference-level explanation
 [reference-level-explanation]: #reference-level-explanation
@@ -363,7 +363,7 @@ The parser already has infrastructure in place to parse very similar constructs.
 While the happy path appears straightforward, error messages need a careful look because they often assume loops, e.g.
 
 ```rust
-fn foo() { 
+fn foo() {
     continue 'label 42
 }
 ```
@@ -382,7 +382,7 @@ That is no longer accurate, and needs rephrasing.
 
 ### type checking
 
-The changes appear straightforward. The only real addition is that the type of the `match` scrutinee matches the `continue` operand, i.e. the types of `expr1` and `expr2` must match in 
+The changes appear straightforward. The only real addition is that the type of the `match` scrutinee matches the `continue` operand, i.e. the types of `expr1` and `expr2` must match in
 ```rust
 'label match expr1 {
     pat => continue 'label expr2
@@ -392,7 +392,7 @@ The changes appear straightforward. The only real addition is that the type of t
 
 ### borrow checking
 
-Borrow checking is implemented on mir, so no specific changes are needed. But, again, error messages will need a careful look 
+Borrow checking is implemented on mir, so no specific changes are needed. But, again, error messages will need a careful look
 
 ### hir -> mir lowering
 
@@ -400,14 +400,14 @@ The meat of this proposal.
 
 #### Intuition
 
-This snippet 
+This snippet
 
 ```rust
 enum State {A, B }
 
-fn example(state: State) { 
+fn example(state: State) {
     let mut state = state;
-    'top: loop { 
+    'top: loop {
         match state {
             State::A => {
                 // perform work
@@ -450,7 +450,7 @@ The proposed labelled match code
 ```rust
 enum State {A, B }
 
-fn example(state: State) { 
+fn example(state: State) {
     'top: match state {
         State::A => {
             // perform work
@@ -486,17 +486,45 @@ will instead generate
     }
 ```
 
-So that control flow is now starting in `bb1`, via `bb4` directly moving to `bb3`. The `State::A -> State::B` (i.e. `bb4 -> bb3`) transition is a direct jump, and also `bb1` will never jump to `bb3` if the initial input is never `State::B`. The branch predictor should be able to pick up on this pattern too. 
+So that control flow is now starting in `bb1`, via `bb4` directly moving to `bb3`. The `State::A -> State::B` (i.e. `bb4 -> bb3`) transition is a direct jump, and also `bb1` will never jump to `bb3` if the initial input is never `State::B`. The branch predictor should be able to pick up on this pattern too.
 
 #### Details
 
+When encountering a `continue 'label value`, rather than the standard desugaring
 
+```
+    bb4: {
+        _2 = const State::B;
+        goto -> bb1;
+    }
+```
 
+we instead desugar by "inlining" the original match
+
+```
+    bb4: {
+        _2 = const State::B;
+        switchInt(move _2) -> [0: bb4, 1: bb3, otherwise: bb2];
+    }
+```
+
+And assume that further MIR optimizations will turn this into just
+
+```
+    bb4: {
+        _2 = const State::B;
+        goto -> bb3;
+    }
+```
+
+This should always be a correct transformation, and should provide the desired code generation.
+
+Next, it is probably beneficial to perform some basic check to see whether a `goto` can be inserted immediately, rather than relying on MIR optimizations to eventually come to that same conclusion. Having the MIR optimizer do the dirty work is both inefficient and may limit further analysis because the naive desugaring introduces control flow paths that are not actually used in practice.
 
 # Drawbacks
 [drawbacks]: #drawbacks
 
-Why should we *not* do this?
+This RFC makes the language more complex. From a compiler perspective the impact is actually quite small, but for users, this is one more feature to learn. Despite building on labeled loops and blocks, exactly how `continue` and `match` interact is probably not exactly obvious at first glance.
 
 # Rationale and alternatives
 [rationale-and-alternatives]: #rationale-and-alternatives
@@ -554,7 +582,7 @@ let mut n = count.div_ceil(4);
 
 ## guaranteed tail calls
 
-In C and other languages, some modern interpreters make use of guaranteed tail calls to ensure that state transitions are just a single jump. 
+In C and other languages, some modern interpreters make use of guaranteed tail calls to ensure that state transitions are just a single jump.
 
 The [wasm3](https://github.com/wasm3/wasm3) webassembly interpreter is a well-known example. Their [design document](https://github.com/wasm3/wasm3/blob/main/docs/Interpreter.md#tightly-chained-operations) describes their approach and also mentions some further prior art.
 
@@ -564,17 +592,17 @@ This [zig issue](https://github.com/ziglang/zig/issues/8220) gives three good re
 - logic must be organized into functions, this has potential performance implications, but also stylistic ones.
 - debugging of logic structured with tail calls is much more difficult than code that stays within a single stack frame
 
-### zlib-rs experience report 
+### zlib-rs experience report
 
 The current zlib-rs implementation uses tail calls. They are not guaranteed, but forced by always building the crate in optimized mode, and crossing our fingers that LLVM will do the right thing. However, despite mostly having unconditional branches between the different states of the decompression state machine, the code is still not as efficient as its C counterpart. The main reason we see (and have verified) is that the C version can keep variables on the stack, while the rust version needs to load them from heap memory in every function. In a perfect world LLVM would be able to optimize values behind a pointer just as well as values on the stack, but we do not live in that world (yet!).
 
-Therefore, we believe that labeled match would substantially improve zlib-rs performance and bring it on-par with C implementations in the vast majority of cases. 
+Therefore, we believe that labeled match would substantially improve zlib-rs performance and bring it on-par with C implementations in the vast majority of cases.
 
 ## Join points
 
 Join points, introduced in [compiling without continuations](https://pauldownen.com/publications/pldi17.pdf), are a construct used in functional languages like Haskell, Lean, Koka and Roc. In all of these languages they are only used within the compiler: there is no explicit syntax for a user to write a join point.
 
-Here is a pseudo-rust implementation of summing then numbers up to `n`. 
+Here is a pseudo-rust implementation of summing then numbers up to `n`.
 
 ```rust
 fn up_to_n(n: usize) -> usize {
@@ -597,7 +625,7 @@ My personal opinion is that join points would be awkward in rust, given that rus
 
 That brings us to this proposal, the labelled match.
 
-The labeled match proposal combines existing rust features of match and labeled blocks/loops. 
+The labeled match proposal combines existing rust features of match and labeled blocks/loops.
 
 The improved code generation that is achieved is required in real programs. My own experience is with [`zlib-rs`](https://github.com/memorysafety/zlib-rs).
 
@@ -616,7 +644,7 @@ Well it doesn't make it easier, though actual occurences will be extremely rare.
 # Prior art
 [prior-art]: #prior-art
 
-This idea is taken fairly directly from zig. 
+This idea is taken fairly directly from zig.
 
 The idea was first introduced in [this issue](https://github.com/ziglang/zig/issues/8220) which has a fair amount of background on how LLVM is not able to optimize certain cases, reasoning about not having a general `goto` in zig, and why tail calls do not cover all cases.
 
