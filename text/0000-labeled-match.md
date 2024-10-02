@@ -66,10 +66,7 @@ loop {
 
 While this is a natural way to express a state machine, it is well-known that when translated to machine code in a naive way, this approach is inefficient on modern CPUs: the match is an unpredictable branch, causing many branch misses. Reducing the number of branch misses is crucial for good performance on modern hardware.
 
-Therefore, labeled match guarantees that state transitions are compiled as efficiently as possible:
-
-- when a state transition has a target known at compile time, the transition is a single unconditional jump to that target
-- when a state transition has a target that is only known at runtime, a jump table is used to jump to that target
+Therefore, labeled match guarantees that **when a state transition has a target known at compile time, the transition is a single unconditional jump to that target**.
 
 In some cases, the LLVM backend already achieves this optimal code generation, but the transformation is not guaranteed and fails for more complex inputs. Furthermore, LLVM is not the only rust codegen backend: it is likely that both `rustc_codegen_gcc` and `rustc_codegen_cranelift` will see more and more use. Hence we should be sceptical of relying on LLVM to achieve good codegen, and prefer performing optimization for all backends on the rustc MIR representation.
 
@@ -155,7 +152,7 @@ The generated jump table and jumping logic looks like this. In particular, the j
 
 **suboptimal codegen**
 
-So far LLVM generates (close to) optimal code. But rustc nor LLVM guarantee that a jump to a compile-time known target is really turned into a direct jump in assembly. We can confuse the LLVM optimizer by adding more state transitions, making it generate a jump table in a program where it is definitely possible to just use direct jumps. Consider ([godbolt link](https://godbolt.org/z/M81bva87o)):
+So far LLVM generates (close to) optimal code. But neither rustc nor LLVM guarantee that a jump to a compile-time known target is really turned into a direct jump in assembly. We can confuse the LLVM optimizer by adding more state transitions, making it generate a jump table in a program where it is definitely possible to just use direct jumps. Consider ([godbolt link](https://godbolt.org/z/M81bva87o)):
 
 ```rust
 #[allow(dead_code)]
@@ -281,7 +278,7 @@ As a programmer, we have no control over this process. Adding one extra state tr
 
 **real-world use cases**
 
-This RFC follows in part from my work on [zlib-rs](https://github.com/trifectatechfoundation/zlib-rs). The decompression logic of zlib is a giant state machine. The C version relies heavily on
+This RFC follows in part from work on [zlib-rs](https://github.com/trifectatechfoundation/zlib-rs). The decompression logic of zlib is a large state machine. The C version relies heavily on
 
 - putting values onto the stack (rather than behind a heap-allocated pointer). In practice, LLVM is a lot better at reasoning about stack values, resulting in better optimizations
 - guaranteed direct jumps between different states, using the fallthrough behavior of C `switch` statements
@@ -331,15 +328,10 @@ fn emulate_labeled_switch() -> Option<u8> {
 
 These functions differ in two ways:
 
-- labeled match can more clearly express intent, especially when implementing interpreters, parsers or other Finite State Automata.
-- labeled match guarantees optimal code generation
+- labeled match can more clearly express intent, especially when implementing interpreters, parsers or other Finite State Automata
+- labeled match guarantees optimal code generation, specifically that a state transition to a statically known next state is an unconditional jump
 
-A straightforward lowering of `emulate_labeled_switch` to machine code would produce inefficient code, because the `match` is an [unpredictable branch](https://en.wikipedia.org/wiki/Branch_predictor). Labeled match guarantees that when the target match branch of a `continue` is known:
-
-- at compiletime, an unconditional jump is generated
-- only at runtime, a jump table is generated
-
-Direct, unconditional jumps do not need to be predicted, and jump tables are also easier on the branch predictor than more basic code generation approaches. The result is faster programs.
+A straightforward lowering of `emulate_labeled_switch` to machine code would produce inefficient code, because the `match` is an [unpredictable branch](https://en.wikipedia.org/wiki/Branch_predictor). Labeled match guarantees that when the target match branch of a `continue` is known, the state transition is just an unconditional jump. Unconditional jumps do not need to be predicted, thus reducing the number of branch misses and improving performance. 
 
 # Reference-level explanation
 [reference-level-explanation]: #reference-level-explanation
@@ -379,6 +371,54 @@ error[E0268]: `continue` outside of a loop
 ```
 
 That is no longer accurate, and needs rephrasing.
+
+### interaction with loops
+
+The rules that are already in place for labeled blocks will be followed when it comes to ambious targets. E.g. this snippet generates an error 
+
+```rust
+    loop {
+        'blk: { 
+            break 42;
+        }
+    }
+```
+
+```
+error[E0695]: unlabeled `break` inside of a labeled block
+ --> <source>:4:13
+  |
+4 |             break 42;
+  |             ^^^^^^^^ `break` statements that would diverge to or through a labeled block need to bear a label
+```
+
+Labeled match would generate a similar error
+
+```rust
+    loop {
+        'blk: match () { 
+            () => break 42,
+        }
+    }
+```
+
+Next, like labeled blocks, the target of a `break` or `continue` is never implicitly a `match`, in other words, this is rejected 
+
+```rust
+match state { 
+    A => continue B,
+    B => ...
+}
+```
+
+with an error that is similar to the one already generated for `break` outside of a loop or labeled block
+
+```
+  |
+4 |             continue B,
+  |             ^^^^^^^^^^ cannot `continue` outside of a loop or labeled match
+  |
+```
 
 ### type checking
 
