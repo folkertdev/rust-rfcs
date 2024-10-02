@@ -8,34 +8,26 @@
 
 This RFC adds labeled match: a `match` can be labelled, and be targeted by a `continue` that takes a single operand. This value is treated as a replacement operand to the `match` expression.
 
-Semantically, this construct is similar to a `match` inside of a loop, with a mutable variable being updated to move to the next state. For instance, these two expressions are equivalent:
+Semantically, this construct is similar to a `match` inside of a loop, with a mutable variable being updated to move to the next state. For instance, these two functions are equivalent:
 
 ```rust
-'top: match state {
-    A => {
-        // <perform work>
-
-        // transition to state B
-        continue 'top B;
-    }
-    B => {
-        break 'top 42;
+fn labeled_switch() -> Option<u8> {
+    'foo: match 1u8 {
+        1 => continue 'foo 2,
+        2 => continue 'foo 3,
+        3 => break 'foo Some(42),
+        _ => None
     }
 }
 
-// --- is equivalent to
-
-'top: loop {
-    let mut state = state;
-    match state {
-        A => {
-            // <perform work>
-
-            state = B;
-            continue 'top;
-        }
-        B => {
-            break 'top 42;
+fn emulate_labeled_switch() -> Option<u8> {
+    let mut state = 1u8;
+    loop {
+        match state {
+            1 => { state = 2; continue; }
+            2 => { state = 3; continue; }
+            3 => { break Some(42) }
+            _ => { break None }
         }
     }
 }
