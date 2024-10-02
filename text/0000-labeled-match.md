@@ -6,7 +6,7 @@
 # Summary
 [summary]: #summary
 
-Labeled matches allow a `match` to be labelled, and to be targeted by a `continue` that takes a single operand. This value is treated as a replacement operand to the `match` expression.
+This RFC adds labeled match: a `match` can be labelled, and be targeted by a `continue` that takes a single operand. This value is treated as a replacement operand to the `match` expression.
 
 Semantically, this construct is similar to a `match` inside of a loop, with a mutable variable being updated to move to the next state. For instance, these two expressions are equivalent:
 
@@ -46,7 +46,7 @@ Semantically, this construct is similar to a `match` inside of a loop, with a mu
 
 The goal of labeled match is improved codegen for state machines. 
 
-State machines (parsers, interpreters, ect) canbe written as a loop containing a match on the current state. The match picks the branch that belongs to the current state, some logic is performed, the state is updated, and eventually control flow jumps back to the top of the loop, branching to the next state. 
+State machines (parsers, interpreters, ect) can be written as a loop containing a match on the current state. The match picks the branch that belongs to the current state, some logic is performed, the state is updated, and eventually control flow jumps back to the top of the loop, branching to the next state. 
 
 ```rust
 loop { 
@@ -64,14 +64,14 @@ loop {
 }
 ```
 
-However, it is well-known that this naive model is inefficient on modern CPUs: the match is an unpredictable branch, causing many branch misses, while having  few branch misses is crucial for good performance on modern hardware.
+While this is a natural way to express a state machine, it is well-known that when translated to machine code in a naive way, this approach is inefficient on modern CPUs: the match is an unpredictable branch, causing many branch misses. Reducing the number of branch misses is crucial for good performance on modern hardware.
 
 Therefore, labeled match guarantees that state transitions are compiled as efficiently as possible:
 
 - when a state transition has a target known at compile time, the transition is a single unconditional jump to that target
 - when a state transition has a target that is only known at runtime, a jump table is used to jump to that target
 
-The LLVM backend already achieves this optimal code generation in some cases, but the transformation is not guaranteed and fails in more complex cases. Furthermore, LLVM is not the only rust codegen backend: it is likely that both `rustc_codegen_gcc` and `rustc_codegen_cranelift` will see more and more use. Hence we should be sceptical of relying on LLVM to achieve good codegen, and prefer performing optimization for all backends on the rustc MIR representation.
+In some cases, the LLVM backend already achieves this optimal code generation, but the transformation is not guaranteed and fails for more complex inputs. Furthermore, LLVM is not the only rust codegen backend: it is likely that both `rustc_codegen_gcc` and `rustc_codegen_cranelift` will see more and more use. Hence we should be sceptical of relying on LLVM to achieve good codegen, and prefer performing optimization for all backends on the rustc MIR representation.
 
 ### What does LLVM do?
 
@@ -302,6 +302,45 @@ Explain the proposal as if it was already included in the language and you were 
 
 For implementation-oriented RFCs (e.g. for compiler internals), this section should focus on how compiler contributors should think about the change, and give examples of its concrete impact. For policy RFCs, this section should provide an example-driven introduction to the policy, and explain its impact in concrete terms.
 
+---
+
+Just like loops, a `match` can be annotated with a label. This label makes the match targetable by `break` and `continue` expressions within the match branches. A break to a match gives the whole match expression the value of the break operand. A continue instead replaces the `match` operand with the `continue` operand, and jumps to the matching case. This construct is semantically equivalent to a `loop` that contains a `match` on a mutable variable, e.g. these two functions are equivalent.
+
+```rust
+fn labeled_switch() -> Option<u8> {
+    'foo: match 1u8 { 
+        1 => continue 'foo 2,
+        2 => continue 'foo 3,
+        3 => break 'foo Some(42),
+        _ => None
+    }
+}
+
+fn emulate_labeled_switch() -> Option<u8> {
+    let mut state = 1u8;
+    loop {
+        match state {
+            1 => { state = 2; continue; }
+            2 => { state = 3; continue; }
+            3 => { break Some(42) }
+            _ => { break None }
+        }
+    }
+}
+```
+
+These functions differ in two ways:
+
+- labeled match can more clearly express intent, especially when implementing interpreters, parsers or other Finite State Automata.
+- labeled match guarantees optimal code generation
+
+A straightforward lowering of `emulate_labeled_switch` to machine code would produce inefficient code, because the `match` is an [unpredictable branch](https://en.wikipedia.org/wiki/Branch_predictor). Labeled match guarantees that when the target match branch of a `continue` is known:
+
+- at compiletime, an unconditional jump is generated
+- only at runtime, a jump table is generated 
+
+Direct, unconditional jumps do not need to be predicted, and jump tables are also easier on the branch predictor than more basic code generation approaches. The result is faster programs. 
+
 # Reference-level explanation
 [reference-level-explanation]: #reference-level-explanation
 
@@ -313,6 +352,147 @@ This is the technical portion of the RFC. Explain the design in sufficient detai
 
 The section should return to the examples given in the previous section, and explain more fully how the detailed proposal makes those examples work.
 
+---
+
+## Implementation notes
+
+### Parsing
+
+The parser already has infrastructure in place to parse very similar constructs. The parser code for `'label match` is based on `'label loop`, and that of `continue 'label value` on the `break 'label value` that can be found in labeled loops and labeled blocks. The `Continue` variant in expr types must be extended to hold an optional value, mirroring `break` which already supports a value.
+
+While the happy path appears straightforward, error messages need a careful look because they often assume loops, e.g.
+
+```rust
+fn foo() { 
+    continue 'label 42
+}
+```
+
+gives the error "continue outside of a loop"
+
+```
+error[E0268]: `continue` outside of a loop
+ --> src/lib.rs:3:15
+  |
+3 |         continue 'label,
+  |         ^^^^^^^^^^^^^^^ cannot `continue` outside of a loop
+```
+
+That is no longer accurate, and needs rephrasing.
+
+### type checking
+
+The changes appear straightforward. The only real addition is that the type of the `match` scrutinee matches the `continue` operand, i.e. the types of `expr1` and `expr2` must match in 
+```rust
+'label match expr1 {
+    pat => continue 'label expr2
+    // ...
+}
+```
+
+### borrow checking
+
+Borrow checking is implemented on mir, so no specific changes are needed. But, again, error messages will need a careful look 
+
+### hir -> mir lowering
+
+The meat of this proposal.
+
+#### Intuition
+
+This snippet 
+
+```rust
+enum State {A, B }
+
+fn example(state: State) { 
+    let mut state = state;
+    'top: loop { 
+        match state {
+            State::A => {
+                // perform work
+                state = State::B;
+                continue 'top;
+            }
+            State::B => {
+                break 'top 42
+            }
+        }
+    };
+}
+```
+
+Produces this MIR today with `--release`. Assuming the initial state is `State::A`, the control flow starts in `bb1`, jumps to `bb4` which updates the state, back to `bb1`, then to `bb3`. The `switchInt` is an unpredictable branch which is taken for every state transition.
+
+```
+    bb1: {
+        _3 = discriminant(_2);
+        switchInt(move _3) -> [0: bb4, 1: bb3, otherwise: bb2];
+    }
+
+    bb2: {
+        unreachable;
+    }
+
+    bb3: {
+        StorageDead(_2);
+        return;
+    }
+
+    bb4: {
+        _2 = const State::B;
+        goto -> bb1;
+    }
+```
+
+The proposed labelled match code
+
+```rust
+enum State {A, B }
+
+fn example(state: State) { 
+    'top: match state {
+        State::A => {
+            // perform work
+            continue 'top State::B;
+        }
+        State::B => {
+            break 'top 42
+        }
+    };
+}
+```
+
+will instead generate
+
+```
+    bb1: {
+        _3 = discriminant(_2);
+        switchInt(move _3) -> [0: bb4, 1: bb3, otherwise: bb2];
+    }
+
+    bb2: {
+        unreachable;
+    }
+
+    bb3: {
+        StorageDead(_2);
+        return;
+    }
+
+    bb4: {
+        _2 = const State::B;
+        goto -> bb3;
+    }
+```
+
+So that control flow is now starting in `bb1`, via `bb4` directly moving to `bb3`. The `State::A -> State::B` (i.e. `bb4 -> bb3`) transition is a direct jump, and also `bb1` will never jump to `bb3` if the initial input is never `State::B`. The branch predictor should be able to pick up on this pattern too. 
+
+#### Details
+
+
+
+
 # Drawbacks
 [drawbacks]: #drawbacks
 
@@ -321,27 +501,126 @@ Why should we *not* do this?
 # Rationale and alternatives
 [rationale-and-alternatives]: #rationale-and-alternatives
 
-- Why is this design the best in the space of possible designs?
-- What other designs have been considered and what is the rationale for not choosing them?
-- What is the impact of not doing this?
-- If this is a language proposal, could this be done in a library or macro instead? Does the proposed change make Rust code easier or harder to read, understand, and maintain?
+Let's look at alternatives in turn
+
+## switch fall-through
+
+In C, the "feature" of `switch` blocks automatically falling through to the following branch is used to guarantee a direct jump between two states. This idea gives rise to examples like [Duff's device](https://en.wikipedia.org/wiki/Duff%27s_device):
+
+```c
+send(to, from, count)
+register short *to, *from;
+register count;
+{
+    register n = (count + 7) / 8;
+    switch (count % 8) {
+    case 0: do { *to = *from++;
+    case 7:      *to = *from++;
+    case 6:      *to = *from++;
+    case 5:      *to = *from++;
+    case 4:      *to = *from++;
+    case 3:      *to = *from++;
+    case 2:      *to = *from++;
+    case 1:      *to = *from++;
+            } while (--n > 0);
+    }
+}
+```
+
+This fall-through behavior is often considered unintuitive, to the point that in many C code bases, such fall-throughs are explicitly labeled to call attention to the fact that the fall-through is deliberate.
+
+But this feature is a part of C for a reason: the fall-through is a direct jump, which is often essential for good performance.
+
+The labeled match proposal has two major advantages over fallthrough:
+
+- there is no need to list branches in a particular order
+- more than one next state can be reached with a direct jump
+
+Furthermore labeled match is very expressive, and can in fact express Durr's device:
+
+```rust
+// originally written by Ralf Jung on zullip
+// assumes count > 0
+// `one()` performs a one-byte write and increments the counters
+let mut n = count.div_ceil(4);
+'top: match count % 4 {
+  0 => { one(); continue 'top 3 }
+  3 => { one(); continue 'top 2 }
+  2 => { one(); continue 'top 1 }
+  1 => { one(); n -= 1; if n > 0 { continue 'top 0; } }
+  _ => unreachable(),
+}
+```
+
+## guaranteed tail calls
+
+In C and other languages, some modern interpreters make use of guaranteed tail calls to ensure that state transitions are just a single jump. 
+
+The [wasm3](https://github.com/wasm3/wasm3) webassembly interpreter is a well-known example. Their [design document](https://github.com/wasm3/wasm3/blob/main/docs/Interpreter.md#tightly-chained-operations) describes their approach and also mentions some further prior art.
+
+This [zig issue](https://github.com/ziglang/zig/issues/8220) gives three good reasons for why guaranteed tail calls don't cover all cases:
+
+- on some targets, tail calls cannot be guaranteed (or at least LLVM currently won't)
+- logic must be organized into functions, this has potential performance implications, but also stylistic ones.
+- debugging of logic structured with tail calls is much more difficult than code that stays within a single stack frame
+
+### zlib-rs experience report 
+
+The current zlib-rs implementation uses tail calls. They are not guaranteed, but forced by always building the crate in optimized mode, and crossing our fingers that LLVM will do the right thing. However, despite mostly having unconditional branches between the different states of the decompression state machine, the code is still not as efficient as its C counterpart. The main reason we see (and have verified) is that the C version can keep variables on the stack, while the rust version needs to load them from heap memory in every function. In a perfect world LLVM would be able to optimize values behind a pointer just as well as values on the stack, but we do not live in that world (yet!).
+
+Therefore, we believe that labeled match would substantially improve zlib-rs performance and bring it on-par with C implementations in the vast majority of cases. 
+
+## Join points
+
+Join points, introduced in [compiling without continuations](https://pauldownen.com/publications/pldi17.pdf), are a construct used in functional languages like Haskell, Lean, Koka and Roc. In all of these languages they are only used within the compiler: there is no explicit syntax for a user to write a join point.
+
+Here is a pseudo-rust implementation of summing then numbers up to `n`. 
+
+```rust
+fn up_to_n(n: usize) -> usize {
+    k#join add |n, accum| {
+        match n {
+            0 => accum,
+            _ => jump name(n - 1, accum + n),
+        }
+    }
+
+    jump name(m)
+}
+```
+
+This logic will compile down to direct jumps between basic blocks in LLVM IR.
+
+My personal opinion is that join points would be awkward in rust, given that rust has much more powerful control flow constructs already (which are not present in the functional languages listed earlier). They would also likely require new syntax/keywords. Note again that none of the listed languages expose join points to users.
+
+## Labelled match
+
+That brings us to this proposal, the labelled match.
+
+The labeled match proposal combines existing rust features of match and labeled blocks/loops. 
+
+The improved code generation that is achieved is required in real programs. My own experience is with [`zlib-rs`](https://github.com/memorysafety/zlib-rs).
+
+**What is the impact of not doing this?**
+
+Rust code is slower than C code
+
+**could this be done in a library or macro instead?**
+
+No, because improved code generation is the entire point of this syntax
+
+**Does the proposed change make Rust code easier or harder to read, understand, and maintain?**
+
+Well it doesn't make it easier, though actual occurences will be extremely rare. Still both the compiler and tooling need to support this additional feature.
 
 # Prior art
 [prior-art]: #prior-art
 
-Discuss prior art, both the good and the bad, in relation to this proposal.
-A few examples of what this can include are:
+This idea is taken fairly directly from zig. 
 
-- For language, library, cargo, tools, and compiler proposals: Does this feature exist in other programming languages and what experience have their community had?
-- For community proposals: Is this done by some other community and what were their experiences with it?
-- For other teams: What lessons can we learn from what other communities have done here?
-- Papers: Are there any published papers or great posts that discuss this? If you have some relevant papers to refer to, this can serve as a more detailed theoretical background.
+The idea was first introduced in [this issue](https://github.com/ziglang/zig/issues/8220) which has a fair amount of background on how LLVM is not able to optimize certain cases, reasoning about not having a general `goto` in zig, and why tail calls do not cover all cases.
 
-This section is intended to encourage you as an author to think about the lessons from other languages, provide readers of your RFC with a fuller picture.
-If there is no prior art, that is fine - your ideas are interesting to us whether they are brand new or if it is an adaptation from other languages.
-
-Note that while precedent set by other languages is some motivation, it does not on its own motivate an RFC.
-Please also take into consideration that rust sometimes intentionally diverges from common language features.
+[This PR](https://github.com/ziglang/zig/pull/21257) implements the feature, and provides a nice summary of the feature and what guarantees zig makes about code generation.
 
 # Unresolved questions
 [unresolved-questions]: #unresolved-questions
