@@ -36,7 +36,7 @@ fn emulate_labeled_switch() -> Option<u8> {
 # Motivation
 [motivation]: #motivation
 
-The goal of labeled match is improved codegen for state machines.
+The goal of labeled match is improved codegen for state machines. Rust being as systems language should be good at writing efficient state machines, and currently falls short.
 
 State machines (parsers, interpreters, ect) can be written as a loop containing a match on the current state. The match picks the branch that belongs to the current state, some logic is performed, the state is updated, and eventually control flow jumps back to the top of the loop, branching to the next state.
 
@@ -56,11 +56,20 @@ loop {
 }
 ```
 
-While this is a natural way to express a state machine, it is well-known that when translated to machine code in a straightforward way, this approach is inefficient on modern CPUs: the match is an unpredictable branch, causing many branch misses. Reducing the number of branch misses is crucial for good performance on modern hardware.
+While this is a natural way to express a state machine, it is well-known that when translated to machine code in a straightforward way, this approach is inefficient on modern CPUs: the match is an unpredictable branch, causing many branch misses. Reducing the number of branch misses is crucial for good performance on modern hardware. A proof of concept implementation shows considerable performance gains versus current recommended workarounds in real-world scenarios:
 
-The equivalent of the above snippet will instead perform a direct jump from the bottom of the `A` branch to the top of the `B` branch: labeled match guarantees that when a state transition has a target that is known at compile time, the transition is a single unconditional jump to that target.
+```
+Benchmark 2 (77 runs): target/release/examples/blogpost-uncompress rs-chunked 4 silesia-small.tar.gz
+  measurement          mean ± σ            min … max           outliers         delta
+  wall_time          65.6ms ± 1.11ms    64.1ms … 72.8ms          1 ( 1%)        ⚡- 15.9% ±  0.5%
+  peak_rss           24.2MB ± 63.3KB    24.0MB … 24.2MB          0 ( 0%)          +  0.1% ±  0.1%
+  cpu_cycles          258M  ± 3.67M      256M  …  287M           7 ( 9%)        ⚡- 16.6% ±  0.4%
+  instructions        710M  ±  301       710M  …  710M           0 ( 0%)        ⚡- 22.5% ±  0.0%
+```
 
-### What does LLVM do?
+The specific proposal in this RFC is that lowering `continue 'label value` from HIR to MIR inserts an unconditional branch (`goto`) when the target is known. Hence, the programmer can structure their program so that this improved lowering kicks in. Of course later MIR passes and the codegen backend are free to optimize from that point as they see fit. Therefore no guarantees can be made about the exact shape of the final assembly.
+
+## What does LLVM do?
 
 In some cases, the LLVM backend already achieves this optimal code generation using unconditional jumps, but the transformation is not guaranteed and fails for more complex inputs. Furthermore, LLVM is not the only rust codegen backend: it is likely that both `rustc_codegen_gcc` and `rustc_codegen_cranelift` will see more and more use. Hence we should be sceptical of relying on LLVM to achieve good codegen, and prefer performing optimization for all backends on the rustc MIR representation.
 
@@ -321,9 +330,9 @@ fn emulate_labeled_switch() -> Option<u8> {
 These functions differ in two ways:
 
 - labeled match can more clearly express intent, especially when implementing interpreters, parsers or other Finite State Automata
-- labeled match guarantees optimal code generation, specifically that a state transition to a statically known next state is an unconditional jump
+- labeled match enables more optimal code generation, specifically that a state transition to a statically known next state becomes unconditional jump
 
-A straightforward lowering of `emulate_labeled_switch` to machine code would produce inefficient code, because the `match` is an [unpredictable branch](https://en.wikipedia.org/wiki/Branch_predictor). Labeled match guarantees that when the target match branch of a `continue` is known, the state transition is just an unconditional jump. Unconditional jumps do not need to be predicted, thus reducing the number of branch misses and improving performance. 
+A straightforward lowering of `emulate_labeled_switch` to machine code would produce inefficient code, because the `match` is an [unpredictable branch](https://en.wikipedia.org/wiki/Branch_predictor). When the target branch of a `continue 'label value` is known at compile time, labeled match will in most cases generate an unconditional branch to the right location. Unconditional jumps do not need to be predicted, so this code generation reduces the number of branch misses and improves performance. 
 
 # Reference-level explanation
 [reference-level-explanation]: #reference-level-explanation
@@ -614,6 +623,56 @@ let mut n = count.div_ceil(4);
 }
 ```
 
+## Labeled blocks
+
+The dedicated programmer can use labeled blocks to simulate the C fallthrough behavior.
+
+One downside of labeled blocks is that it scales poorly: each state needs its own scope, adding at least one level of indentation. 
+I'd also argue that following the control flow is much harder, specifically because there are now implicit fallthroughs between states.
+Compare these semantically equivalent implementations:
+
+```rust
+fn labeled_blocks() -> Option<u8> { 
+    'foo { 
+        's3 { 
+            's2 { 
+                's1 { 
+                    match 1u8 {
+                        1 => break 's1,
+                        2 => break 's2,
+                        3 => break 's3, 
+                        _ => break 'foo None,
+                    }
+                }
+
+                // s1 logic 
+
+                // fallthrough to s2
+            }
+
+            // s2 logic 
+
+            // fallthrough to s3
+        }
+
+        break 'foo Some(42)
+    }
+}
+
+fn labeled_switch() -> Option<u8> {
+    'foo: match 1u8 {
+        1 => continue 'foo 2,
+        2 => continue 'foo 3,
+        3 => break 'foo Some(42),
+        _ => None
+    }
+}
+```
+
+Macros can be used to tame the syntactic complexity to some extent, but that just introduces custom syntax to learn for something as fundamental to a low level programming language as a state machine. Also the editor experience within macros is still not as good as for first-class language constructs.
+
+The second limitation is that only forward jumps (from an earlier to a later branch) are possible. To go back to an earlier branch, a loop and unpredictable match are still required. Thus, labeled match wins both in expressivity and code generation quality.
+
 ## guaranteed tail calls
 
 In C and other languages, some modern interpreters make use of guaranteed tail calls to ensure that state transitions are just a single jump.
@@ -630,7 +689,18 @@ This [zig issue](https://github.com/ziglang/zig/issues/8220) gives three good re
 
 The current zlib-rs implementation uses tail calls. They are not guaranteed, but forced by always building the crate in optimized mode, and crossing our fingers that LLVM will do the right thing. However, despite mostly having unconditional branches between the different states of the decompression state machine, the code is still not as efficient as its C counterpart. The main reason we see (and have verified) is that the C version can keep variables on the stack, while the rust version needs to load them from heap memory in every function. In a perfect world LLVM would be able to optimize values behind a pointer just as well as values on the stack, but we do not live in that world (yet!).
 
-Therefore, we believe that labeled match would substantially improve zlib-rs performance and bring it on-par with C implementations in the vast majority of cases.
+To test this hypothesis, @bjorn3 implemented a basic version of this RFC. In the cases where it matters, we see a drastic performance improvement versus tail calls: 
+
+```
+Benchmark 2 (77 runs): target/release/examples/blogpost-uncompress rs-chunked 4 silesia-small.tar.gz
+  measurement          mean ± σ            min … max           outliers         delta
+  wall_time          65.6ms ± 1.11ms    64.1ms … 72.8ms          1 ( 1%)        ⚡- 15.9% ±  0.5%
+  peak_rss           24.2MB ± 63.3KB    24.0MB … 24.2MB          0 ( 0%)          +  0.1% ±  0.1%
+  cpu_cycles          258M  ± 3.67M      256M  …  287M           7 ( 9%)        ⚡- 16.6% ±  0.4%
+  instructions        710M  ±  301       710M  …  710M           0 ( 0%)        ⚡- 22.5% ±  0.0%
+```
+
+We also [tried](https://rust-lang.zulipchat.com/#narrow/stream/213817-t-lang/topic/Fallthrough.20in.20Match.20Statements/near/474684276) nested labeled blocks, just to see what that would do. We observed that labeled blocks were better for some inputs, but worse for others. The experimental version of labeled match is better in some cases, but never worse than tail calls in our benchmarks.
 
 ## Join points
 
@@ -655,6 +725,25 @@ This logic will compile down to direct jumps between basic blocks in LLVM IR.
 
 My personal opinion is that join points would be awkward in rust, given that rust has much more powerful control flow constructs already (which are not present in the functional languages listed earlier). They would also likely require new syntax/keywords. Note again that none of the listed languages expose join points to users.
 
+## Safe GOTO
+
+The feature proposed in https://internals.rust-lang.org/t/pre-rfc-safe-goto-with-value/14470/51 touches on a lot of the same problems.
+
+The advantage of labeled match is that it is not as syntactically experimental. No new constructs or keywords are really needed, we "just" allow labels before match, and add an operand to `continue` just like `break` already has. 
+
+Because adding e.g. a `goto` keyword is probably a no-go, the conversation quickly shifts to using macros instead to get both a better syntax for writing state machines, and get the desired codegen. 
+
+## improve MIR optimizations
+
+In theory, more sophisiticated analysis of the MIR should be able to optimize the "loop + match" pattern into a collection of unconditional jumps. We've seen that it's not capable of performing this optimization today, but if it could, then maybe labeled match would not be needed. 
+
+I'm sceptical that, in general, the need for labeled match would go away entirely:
+
+- LLVM cannot perform this optimization either (MIR does have more information but still)
+- Optimization pipelines are unreliable: they can break when the input function is too large, or too complex. 
+
+Labeled match reliably gives the desired codegen in almost all cases. An unconditional jump is not a hard guarantee, but the situation is similar to tail-call elimination in languages that have it: if you write your code a certain way, you can actually be sure of the optimization.
+
 ## Labeled match
 
 That brings us to this proposal, the labeled match.
@@ -665,7 +754,7 @@ Labeled match is not blocked on LLVM, and can be implemented entirely in rustc, 
 
 Labeled match does not introduce arbitrary control flow (like general `goto`) or surprising implicit control flow (like `switch` fallthrough in C and descendants).
 
-The codegen guarantees provided by labeled are essential in real-world programs, like [`zlib-rs`](https://github.com/memorysafety/zlib-rs). The lack of such a guarantee actively limits the adoption of rust in domains performance is key. Without a feature like this, it is effectively impossible to beat C in certain cases.
+The codegen characteristics provided by labeled match are essential in real-world programs, like [`zlib-rs`](https://github.com/memorysafety/zlib-rs). The inability to generate efficient code actively limits the adoption of rust in domains where performance is key. Without a feature like this, it is effectively impossible to beat C in certain cases.
 
 # Prior art
 [prior-art]: #prior-art
