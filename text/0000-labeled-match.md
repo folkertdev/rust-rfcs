@@ -1,4 +1,4 @@
-- Feature Name: `labelled_match`
+- Feature Name: `labeled_match`
 - Start Date: 2024-09-26
 - RFC PR: [rust-lang/rfcs#0000](https://github.com/rust-lang/rfcs/pull/0000)
 - Rust Issue: [rust-lang/rust#0000](https://github.com/rust-lang/rust/issues/0000)
@@ -6,7 +6,7 @@
 # Summary
 [summary]: #summary
 
-This RFC adds labeled match: a `match` can be labelled, and be targeted by a `continue` that takes a single operand. This value is treated as a replacement operand to the `match` expression.
+This RFC adds labeled match: a `match` can be labeled, and be targeted by a `continue` that takes a single operand. This value is treated as a replacement operand to the `match` expression.
 
 This construct is similar to a `match` inside of a loop, with a mutable variable being updated to move to the next state. For instance, these two functions are semantically equivalent:
 
@@ -69,7 +69,9 @@ Benchmark 2 (77 runs): target/release/examples/blogpost-uncompress rs-chunked 4 
 
 The specific proposal in this RFC is that lowering `continue 'label value` from HIR to MIR inserts an unconditional branch (`goto`) when the target is known. Hence, the programmer can structure their program so that this improved lowering kicks in. Of course later MIR passes and the codegen backend are free to optimize from that point as they see fit. Therefore no guarantees can be made about the exact shape of the final assembly.
 
-## What does LLVM do?
+## Doesn't LLVM do this already?
+
+No.
 
 In some cases, the LLVM backend already achieves this optimal code generation using unconditional jumps, but the transformation is not guaranteed and fails for more complex inputs. Furthermore, LLVM is not the only rust codegen backend: it is likely that both `rustc_codegen_gcc` and `rustc_codegen_cranelift` will see more and more use. Hence we should be sceptical of relying on LLVM to achieve good codegen, and prefer performing optimization for all backends on the rustc MIR representation.
 
@@ -279,7 +281,7 @@ As a programmer, we have no control over this process. Adding one extra state tr
 
 **real-world use cases**
 
-This RFC follows in part from work on [zlib-rs](https://github.com/trifectatechfoundation/zlib-rs). The decompression logic of zlib is a large state machine. The C version relies heavily on
+Performant state machines are important in real-world projects. This RFC follows in part from work on [zlib-rs](https://github.com/trifectatechfoundation/zlib-rs). The decompression logic of zlib is a large state machine. The C version relies heavily on:
 
 - putting values onto the stack (rather than behind a heap-allocated pointer). In practice, LLVM is a lot better at reasoning about stack values, resulting in better optimizations
 - guaranteed direct jumps between different states, using the fallthrough behavior of C `switch` statements
@@ -330,9 +332,9 @@ fn emulate_labeled_switch() -> Option<u8> {
 These functions differ in two ways:
 
 - labeled match can more clearly express intent, especially when implementing interpreters, parsers or other Finite State Automata
-- labeled match enables more optimal code generation, specifically that a state transition to a statically known next state becomes unconditional jump
+- labeled match enables more optimal code generation: when the next branch is known at compile time, rustc will try to jump there directly
 
-A straightforward lowering of `emulate_labeled_switch` to machine code would produce inefficient code, because the `match` is an [unpredictable branch](https://en.wikipedia.org/wiki/Branch_predictor). When the target branch of a `continue 'label value` is known at compile time, labeled match will in most cases generate an unconditional branch to the right location. Unconditional jumps do not need to be predicted, so this code generation reduces the number of branch misses and improves performance. 
+A straightforward lowering of `emulate_labeled_switch` to machine code would produce inefficient code, because the `match` is an [unpredictable branch](https://en.wikipedia.org/wiki/Branch_predictor). When the target branch of a `continue 'label value` is known at compile time, labeled match will in most cases generate an unconditional branch to the right location. Unconditional jumps do not need to be predicted, so this code generation reduces the number of branch misses and improves performance.
 
 # Reference-level explanation
 [reference-level-explanation]: #reference-level-explanation
@@ -375,11 +377,11 @@ That is no longer accurate, and needs rephrasing.
 
 ### interaction with loops
 
-The rules that are already in place for labeled blocks will be followed when it comes to ambious targets. E.g. this snippet generates an error 
+The rules that are already in place for labeled blocks will be followed when it comes to ambious targets. E.g. this snippet generates an error
 
 ```rust
     loop {
-        'blk: { 
+        'blk: {
             break 42;
         }
     }
@@ -393,20 +395,20 @@ error[E0695]: unlabeled `break` inside of a labeled block
   |             ^^^^^^^^ `break` statements that would diverge to or through a labeled block need to bear a label
 ```
 
-Labeled match would generate a similar error
+This labeled match would generate a similar error
 
 ```rust
     loop {
-        'blk: match () { 
+        'blk: match () {
             () => break 42,
         }
     }
 ```
 
-Next, like labeled blocks, the target of a `break` or `continue` is never implicitly a `match`, in other words, this is rejected 
+Next, like labeled blocks, the target of a `break` or `continue` is never implicitly a `match`, in other words, this is rejected
 
 ```rust
-match state { 
+match state {
     A => continue B,
     B => ...
 }
@@ -433,7 +435,7 @@ The changes appear straightforward. The only real addition is that the type of t
 
 ### borrow checking
 
-Borrow checking is implemented on mir, so no specific changes are needed. But, again, error messages will need a careful look
+Borrow checking is implemented on MIR, so no specific changes are needed. But, again, error messages will need a careful look
 
 ### hir -> mir lowering
 
@@ -486,9 +488,9 @@ Produces this MIR today with `--release`. Assuming the initial state is `State::
     }
 ```
 
-> NOTE: a separate MIR pass could perform jump threading, and turn the repeated jumps into a single unconditional jump. Apparently the current implementation relies on LLVM performing this analysis, and we've already seen that it is not perfect. Hence, it seems likely that a jump threading pass on MIR would similarly not cover all cases and therefore would be fragile. 
+> NOTE: a separate MIR pass could perform jump threading, and turn the repeated jumps into a single unconditional jump. Apparently the current implementation relies on LLVM performing this analysis, and we've already seen that it is not perfect. Hence, it seems likely that a jump threading pass on MIR would similarly not cover all cases and therefore would be fragile.
 
-The proposed labelled match code
+The proposed labeled match code
 
 ```rust
 enum State {A, B }
@@ -531,9 +533,9 @@ will instead generate
 
 So that control flow is now starting in `bb1`, via `bb4` directly moving to `bb3`. The `State::A -> State::B` (i.e. `bb4 -> bb3`) transition is a direct jump, and also `bb1` will never jump to `bb3` if the initial input is never `State::B`. The branch predictor should be able to pick up on this pattern too.
 
-#### Details
+#### Lowering Details
 
-When encountering a `continue 'label value`, rather than the standard desugaring
+When encountering a `continue 'label value`, rather than the standard desugaring that jumps back to the top of the loop
 
 ```
     bb4: {
@@ -551,7 +553,7 @@ we instead desugar by "inlining" the original match
     }
 ```
 
-And assume that further MIR optimizations will turn this into just
+And then perform constant propagation into the `switchInt`, so that we get
 
 ```
     bb4: {
@@ -560,9 +562,11 @@ And assume that further MIR optimizations will turn this into just
     }
 ```
 
-This should always be a correct transformation, and should provide the desired code generation.
+Today, MIR optimizations are apparently not capable of simplifying the above into a `goto`. Even if they were, it is probably still beneficial to perform a check to see whether a `goto` can be inserted immediately during lowering, rather than relying on MIR optimizations to eventually come to that same conclusion. Having the MIR optimizer do the dirty work is both inefficient and may limit further analysis because the naive desugaring introduces control flow paths that are not actually used in practice.
 
-Next, it is probably beneficial to perform some basic check to see whether a `goto` can be inserted immediately, rather than relying on MIR optimizations to eventually come to that same conclusion. Having the MIR optimizer do the dirty work is both inefficient and may limit further analysis because the naive desugaring introduces control flow paths that are not actually used in practice.
+Of course, it may not be possible to pick the right branch at this point. Maybe the value is truly only known at runtime, or some amount of inlining needs to occcur before the value can be known. In experiments so far, duplicating the match does not leed to duplicated code in the final assembly. But more experimentation is needed: maybe a lowering to the standard "loop + match" is better in some cases.
+
+This basic lowering does not consider nested patterns, but does appear to work well with e.g. patterns with guards. As an initial version, this likely already covers the vast majority of cases. Further improvements to the code generation can be implemented incrementally.
 
 # Drawbacks
 [drawbacks]: #drawbacks
@@ -598,7 +602,7 @@ register count;
 }
 ```
 
-This fall-through behavior is often considered unintuitive, to the point that in many C code bases, such fall-throughs are explicitly labeled to call attention to the fact that the fall-through is deliberate.
+This fall-through behavior is often considered unintuitive, to the point that in many C code bases, such fall-throughs are explicitly labeled with a comment to call attention to the fact that the fall-through is deliberate.
 
 But this feature is a part of C for a reason: the fall-through is a direct jump, which is often essential for good performance.
 
@@ -627,30 +631,30 @@ let mut n = count.div_ceil(4);
 
 The dedicated programmer can use labeled blocks to simulate the C fallthrough behavior.
 
-One downside of labeled blocks is that it scales poorly: each state needs its own scope, adding at least one level of indentation. 
-I'd also argue that following the control flow is much harder, specifically because there are now implicit fallthroughs between states.
+One downside of labeled blocks is that it scales poorly: each state needs its own scope, adding at least one level of indentation.
+Following the control flow is tricky, especially because there are now implicit fallthroughs between states.
 Compare these semantically equivalent implementations:
 
 ```rust
-fn labeled_blocks() -> Option<u8> { 
-    'foo { 
-        's3 { 
-            's2 { 
-                's1 { 
+fn labeled_blocks() -> Option<u8> {
+    'foo {
+        's3 {
+            's2 {
+                's1 {
                     match 1u8 {
                         1 => break 's1,
                         2 => break 's2,
-                        3 => break 's3, 
+                        3 => break 's3,
                         _ => break 'foo None,
                     }
                 }
 
-                // s1 logic 
+                // s1 logic
 
                 // fallthrough to s2
             }
 
-            // s2 logic 
+            // s2 logic
 
             // fallthrough to s3
         }
@@ -669,9 +673,11 @@ fn labeled_switch() -> Option<u8> {
 }
 ```
 
-Macros can be used to tame the syntactic complexity to some extent, but that just introduces custom syntax to learn for something as fundamental to a low level programming language as a state machine. Also the editor experience within macros is still not as good as for first-class language constructs.
+Nested labeled blocks do not spark joy.
 
-The second limitation is that only forward jumps (from an earlier to a later branch) are possible. To go back to an earlier branch, a loop and unpredictable match are still required. Thus, labeled match wins both in expressivity and code generation quality.
+Macros can be used to tame the syntactic complexity to some extent, but that just introduces custom syntax to learn for something as fundamental to a low level programming language as a state machine. Furthermore, editor experience within macros is still not as good as for first-class language constructs.
+
+The second limitation is that only forward jumps (from an earlier to a later branch) are possible. To go back to an earlier branch, a loop and unpredictable match are still required. Thus, labeled match wins in brevity, expressivity and code generation quality.
 
 ## guaranteed tail calls
 
@@ -689,7 +695,7 @@ This [zig issue](https://github.com/ziglang/zig/issues/8220) gives three good re
 
 The current zlib-rs implementation uses tail calls. They are not guaranteed, but forced by always building the crate in optimized mode, and crossing our fingers that LLVM will do the right thing. However, despite mostly having unconditional branches between the different states of the decompression state machine, the code is still not as efficient as its C counterpart. The main reason we see (and have verified) is that the C version can keep variables on the stack, while the rust version needs to load them from heap memory in every function. In a perfect world LLVM would be able to optimize values behind a pointer just as well as values on the stack, but we do not live in that world (yet!).
 
-To test this hypothesis, @bjorn3 implemented a basic version of this RFC. In the cases where it matters, we see a drastic performance improvement versus tail calls: 
+To test this hypothesis, @bjorn3 implemented a basic version of this RFC. In the cases where it matters, we see a drastic performance improvement versus tail calls:
 
 ```
 Benchmark 2 (77 runs): target/release/examples/blogpost-uncompress rs-chunked 4 silesia-small.tar.gz
@@ -704,43 +710,26 @@ We also [tried](https://rust-lang.zulipchat.com/#narrow/stream/213817-t-lang/top
 
 ## Join points
 
-Join points, introduced in [compiling without continuations](https://pauldownen.com/publications/pldi17.pdf), are a construct used in functional languages like Haskell, Lean, Koka and Roc. In all of these languages they are only used within the compiler: there is no explicit syntax for a user to write a join point.
+In functional languages, where closures are typically heap-allocated, non-toplevel functions can be promoted to join points. Join points are never heap-allocated (hence are cheaper to create and do not need to be garbage collected), and are able to express iteration without growing the stack. Join points were introduced in [compiling without continuations](https://pauldownen.com/publications/pldi17.pdf) to solve the performance problem of heap-allocated closures without compromising on the algebraic properties of functional languages.
 
-Here is a pseudo-rust implementation of summing then numbers up to `n`.
+Join points are implemented in at least Haskell, Lean, Koka and Roc. None of these languages have explicit syntax for a user to write a join point: programmers know the rules the compiler uses to promote a binding to a join point, and write their code so that the optimization kicks in. This is similar to how these and other languages guarantee tail-call elimination if the code is structured a certain way.
 
-```rust
-fn up_to_n(n: usize) -> usize {
-    k#join add |n, accum| {
-        match n {
-            0 => accum,
-            _ => jump name(n - 1, accum + n),
-        }
-    }
-
-    jump name(m)
-}
-```
-
-This logic will compile down to direct jumps between basic blocks in LLVM IR.
-
-My personal opinion is that join points would be awkward in rust, given that rust has much more powerful control flow constructs already (which are not present in the functional languages listed earlier). They would also likely require new syntax/keywords. Note again that none of the listed languages expose join points to users.
+But, rust does not have problem (heap-allocated closure) or the constraint (nice algebraic rewriting properties) of the languages where this construct is used. Closures in rust are already cheap to create and stored on the stack. Mutation and constructs like loops with breaks make applying rewrite rules of the style used in functional compilers virtually impossible already.
 
 ## Safe GOTO
 
-The feature proposed in https://internals.rust-lang.org/t/pre-rfc-safe-goto-with-value/14470/51 touches on a lot of the same problems.
+The feature proposed in https://internals.rust-lang.org/t/pre-rfc-safe-goto-with-value/14470/51 touches on a lot of the same problems as this RFC.
 
-The advantage of labeled match is that it is not as syntactically experimental. No new constructs or keywords are really needed, we "just" allow labels before match, and add an operand to `continue` just like `break` already has. 
-
-Because adding e.g. a `goto` keyword is probably a no-go, the conversation quickly shifts to using macros instead to get both a better syntax for writing state machines, and get the desired codegen. 
+The advantage of labeled match is that it is not as syntactically experimental. No new constructs or keywords are really needed, we "just" allow labels before match, and add an operand to `continue` just like `break` already has. Labeled match fits into current rust nicely, while being just as expressive.
 
 ## improve MIR optimizations
 
-In theory, more sophisiticated analysis of the MIR should be able to optimize the "loop + match" pattern into a collection of unconditional jumps. We've seen that it's not capable of performing this optimization today, but if it could, then maybe labeled match would not be needed. 
+In theory, more sophisiticated analysis of the MIR should be able to optimize the "loop + match" pattern into a collection of unconditional jumps. We've seen that it's not capable of performing this optimization today, but if it could, then maybe labeled match would not be needed.
 
 I'm sceptical that, in general, the need for labeled match would go away entirely:
 
 - LLVM cannot perform this optimization either (MIR does have more information but still)
-- Optimization pipelines are unreliable: they can break when the input function is too large, or too complex. 
+- Optimization pipelines are unreliable: they can break when the input function is too large, or too complex.
 
 Labeled match reliably gives the desired codegen in almost all cases. An unconditional jump is not a hard guarantee, but the situation is similar to tail-call elimination in languages that have it: if you write your code a certain way, you can actually be sure of the optimization.
 
@@ -750,7 +739,7 @@ That brings us to this proposal, the labeled match.
 
 The labeled match proposal combines existing rust features of match and labeled blocks/loops. It is just the interaction between these concepts that has to be learned, no new keywords or syntactic constructions are needed.
 
-Labeled match is not blocked on LLVM, and can be implemented entirely in rustc, providing benefits to all code generation backends. 
+Labeled match is not blocked on LLVM, and can be implemented entirely in rustc, providing benefits to all code generation backends.
 
 Labeled match does not introduce arbitrary control flow (like general `goto`) or surprising implicit control flow (like `switch` fallthrough in C and descendants).
 
@@ -774,21 +763,3 @@ The idea was first introduced in [this issue](https://github.com/ziglang/zig/iss
 
 # Future possibilities
 [future-possibilities]: #future-possibilities
-
-Think about what the natural extension and evolution of your proposal would
-be and how it would affect the language and project as a whole in a holistic
-way. Try to use this section as a tool to more fully consider all possible
-interactions with the project and language in your proposal.
-Also consider how this all fits into the roadmap for the project
-and of the relevant sub-team.
-
-This is also a good place to "dump ideas", if they are out of scope for the
-RFC you are writing but otherwise related.
-
-If you have tried and cannot think of any future possibilities,
-you may simply state that you cannot think of anything.
-
-Note that having something written down in the future-possibilities section
-is not a reason to accept the current or a future RFC; such notes should be
-in the section on motivation or rationale in this or subsequent RFCs.
-The section merely provides additional information.
