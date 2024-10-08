@@ -36,7 +36,20 @@ fn emulate_labeled_switch() -> Option<u8> {
 # Motivation
 [motivation]: #motivation
 
-The goal of labeled match is improved codegen for state machines. Rust being as systems language should be good at writing efficient state machines, and currently falls short.
+The goal of labeled match is improved ergonomics and codegen for state machines. Rust being as systems language should be good at writing efficient state machines, and currently falls short. Complex state machines are niche, but extremely important.
+
+## Ergonomics
+
+State machines require fairly flexible control flow. However, the unstructured control flow of C is in many ways too flexible: it is hard for programmers to understand and for tools (e.g. the borrow checker) to reason about and give good errors for. We have to find a middle ground between code that is easy to understand (by human and machine), interacts well with other rust features, and flexible enough to efficiently express state machine logic.
+
+Today, the choice is often between a readable, but inefficient implementation (see below), or a complex unreadable version (featuring nested labeled blocks and loops). Labeled match provides meaningfully more expresivity, while staying very close to existing rust concepts.
+
+A niche, but very valuable use case is [c2rust](https://github.com/immunant/c2rust). The sort of C code base where c2rust is used often uses "cursed" control flow, like switch branches implicitly falling through, or even explicit `goto` statements. Being able to lower these, in most cases, to a labeled match greatly improves both the readability of the generated code, speeding up the porting process.
+
+
+Many other parser, decoder and other lowlevel crates will similarly benefit from the ergonomics of labeled match.
+
+## Code generation
 
 State machines (parsers, interpreters, ect) can be written as a loop containing a match on the current state. The match picks the branch that belongs to the current state, some logic is performed, the state is updated, and eventually control flow jumps back to the top of the loop, branching to the next state.
 
@@ -69,7 +82,7 @@ Benchmark 2 (77 runs): target/release/examples/blogpost-uncompress rs-chunked 4 
 
 The specific proposal in this RFC is that lowering `continue 'label value` from HIR to MIR inserts an unconditional branch (`goto`) when the target is known. Hence, the programmer can structure their program so that this improved lowering kicks in. Of course later MIR passes and the codegen backend are free to optimize from that point as they see fit. Therefore no guarantees can be made about the exact shape of the final assembly.
 
-## Doesn't LLVM do this already?
+## Doesn't LLVM optimize this already?
 
 No.
 
@@ -352,12 +365,12 @@ The section should return to the examples given in the previous section, and exp
 The changes to the language are:
 
 - we allow labeling of `match` expressions: `'label: match scrutinee { ... }`
-- `break 'label <operand>` expressions can target the labeled match, giving the whole match expression the value of `<operand>` 
+- `break 'label <operand>` expressions can target the labeled match, giving the whole match expression the value of `<operand>`
 - `continue 'label <operand>` expressions can target the labeled match, replacing `scrutinee` with `<operand>` and proceding to the correct match branch
 
 ## Edge cases
 
-Behavior is as consistent as possible with labeled loops and labeled blocks. 
+Behavior is as consistent as possible with labeled loops and labeled blocks.
 
 **not implicit**
 
@@ -412,7 +425,7 @@ This labeled match would generate a similar error
 
 **in scope**
 
-A labeled match can be targeted by a `break` and `continue` when the label is in scope. That means that, though unlikely to be of practical value, these snippets are valid. 
+A labeled match can be targeted by a `break` and `continue` when the label is in scope. That means that, though unlikely to be of practical value, these snippets are valid.
 
 ```rust
 let _: () = 'foo: match break 'foo {};
@@ -423,7 +436,7 @@ let _: () = 'foo: match break 'foo {};
 }
 ```
 
-This behavior is similar to loops, where e.g. this is a valid rust expression 
+This behavior is similar to loops, where e.g. this is a valid rust expression
 
 ```rust
 'foo: while break 'foo {}
@@ -469,7 +482,7 @@ The changes should be straightforward, although they were skipped in the PoC. Th
 
 ### borrow checking
 
-Borrow checking is implemented on MIR, so no specific changes are needed from a correctness perspective. But because labeled match can create loop-like control flow, there are new error cases that need some specific care. 
+Borrow checking is implemented on MIR, so no specific changes are needed from a correctness perspective. But because labeled match can create loop-like control flow, there are new error cases that need some specific care.
 
 ### hir -> mir lowering
 
@@ -758,7 +771,7 @@ The advantage of labeled match is that it is not as syntactically experimental. 
 
 ## Computed goto
 
-A feature of some C compilers where syntax is provided for creation of jump tables. E.g. 
+A feature of some C compilers where syntax is provided for creation of jump tables. E.g.
 
 ```c
 int interp_cgoto(unsigned char* code, int initval) {
@@ -800,16 +813,16 @@ int interp_cgoto(unsigned char* code, int initval) {
 
 [source](https://eli.thegreenplace.net/2012/07/12/computed-goto-for-efficient-dispatch-tables)
 
-There are two reasons one might use a computed goto 
+There are two reasons one might use a computed goto
 
-- get better code generation than the standard "loop + match" 
+- get better code generation than the standard "loop + match"
 - indexing into an array of future states is more natural than a match
 
-However, labeled match promises even better code generation than the jump table that computed goto produces in cases where targets are compile-time known, and has roughly similar ergonomics, e.g. 
+However, labeled match promises even better code generation than the jump table that computed goto produces in cases where targets are compile-time known, and has roughly similar ergonomics, e.g.
 
 ```rust
 macro_rules! dispatch() {
-    () => { 
+    () => {
         let temp = code[pc]; // or .get_unchecked
         pc += 1;
         temp
@@ -818,7 +831,7 @@ macro_rules! dispatch() {
 
 'top: match dispatch!() {
     DO_HALT => break 'top val,
-    DO_INC => { 
+    DO_INC => {
         val += 1;
         continue 'top dispatch!();
     DO_DEC => {
@@ -837,7 +850,7 @@ macro_rules! dispatch() {
         val += 7;
         continue 'top dispatch!();
     }
-    DO_NEG => { 
+    DO_NEG => {
         val = -val;
         continue 'top dispatch!();
     }
@@ -854,14 +867,14 @@ In theory, more sophisiticated analysis of the MIR should be able to optimize th
 While improvements to rust's MIR passes are certainly possible, limitations are:
 
 - the implementation complexity
-- the compile time cost 
+- the compile time cost
 - analysis is fragile
 
 In contrast
 
 - labeled match is a desugaring no more complex than labeled loops and blocks
 - the transformation is syntactic, and therefore nicely bounded
-- programmers can write their code in such a way that they can be confident the desugaring to a `goto` kicks in 
+- programmers can write their code in such a way that they can be confident the desugaring to a `goto` kicks in
 
 So, labeled match is a solid way to make progress on better codegen. Improved optimizations on MIR are also very welcome, but never entirely remove the need for labeled match from a programmer's perspective.
 
