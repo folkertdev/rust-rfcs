@@ -62,7 +62,7 @@ While this is a natural way to express a state machine, it is well-known that wh
 Benchmark 2 (77 runs): target/release/examples/blogpost-uncompress rs-chunked 4 silesia-small.tar.gz
   measurement          mean ± σ            min … max           outliers         delta
   wall_time          65.6ms ± 1.11ms    64.1ms … 72.8ms          1 ( 1%)        ⚡- 15.9% ±  0.5%
-  peak_rss           24.2MB ± 63.3KB    24.0MB … 24.2MB          0 ( 0%)          +  0.1% ±  0.1%
+  peak_rss           24.2MB ± 63.3KB    24.0MB … 24.2MB          0 ( 0%)         +  0.1% ±  0.1%
   cpu_cycles          258M  ± 3.67M      256M  …  287M           7 ( 9%)        ⚡- 16.6% ±  0.4%
   instructions        710M  ±  301       710M  …  710M           0 ( 0%)        ⚡- 22.5% ±  0.0%
 ```
@@ -279,14 +279,14 @@ LLVM has generated a jump table, and all state transitions go via this jump tabl
 
 As a programmer, we have no control over this process. Adding one extra state transition to your program, or making some other small change, can thus cause a major performance regression.
 
-**real-world use cases**
+## real-world use cases
 
 Performant state machines are important in real-world projects. This RFC follows in part from work on [zlib-rs](https://github.com/trifectatechfoundation/zlib-rs). The decompression logic of zlib is a large state machine. The C version relies heavily on:
 
 - putting values onto the stack (rather than behind a heap-allocated pointer). In practice, LLVM is a lot better at reasoning about stack values, resulting in better optimizations
 - guaranteed direct jumps between different states, using the fallthrough behavior of C `switch` statements
 
-Today, we cannot achieve the same codegen as C implementations. This limitation actively harms the adoption of rust in high-performance areas like compression.
+Today, we simply cannot achieve the same codegen as C implementations. This limitation actively harms the adoption of rust in high-performance areas like compression.
 
 # Guide-level explanation
 [guide-level-explanation]: #guide-level-explanation
@@ -329,12 +329,12 @@ fn emulate_labeled_switch() -> Option<u8> {
 }
 ```
 
-These functions differ in two ways:
+Labeled match differs from the "loop + match" in two ways:
 
 - labeled match can more clearly express intent, especially when implementing interpreters, parsers or other Finite State Automata
 - labeled match enables more optimal code generation: when the next branch is known at compile time, rustc will try to jump there directly
 
-A straightforward lowering of `emulate_labeled_switch` to machine code would produce inefficient code, because the `match` is an [unpredictable branch](https://en.wikipedia.org/wiki/Branch_predictor). When the target branch of a `continue 'label value` is known at compile time, labeled match will in most cases generate an unconditional branch to the right location. Unconditional jumps do not need to be predicted, so this code generation reduces the number of branch misses and improves performance.
+A straightforward lowering of `emulate_labeled_switch` to machine code would produce inefficient code, because the `match` is an [unpredictable branch](https://en.wikipedia.org/wiki/Branch_predictor). When the target branch of a `continue 'label value` is known at compile time, labeled match will in most cases generate an unconditional branch to the right location. Unconditional jumps do not need to be predicted, so this code generation approach reduces the number of branch misses and improves performance.
 
 # Reference-level explanation
 [reference-level-explanation]: #reference-level-explanation
@@ -349,35 +349,40 @@ The section should return to the examples given in the previous section, and exp
 
 ---
 
-## Implementation notes
+The changes to the language are:
 
-### Parsing
+- we allow labeling of `match` expressions: `'label: match scrutinee { ... }`
+- `break 'label <operand>` expressions can target the labeled match, giving the whole match expression the value of `<operand>` 
+- `continue 'label <operand>` expressions can target the labeled match, replacing `scrutinee` with `<operand>` and proceding to the correct match branch
 
-The parser already has infrastructure in place to parse very similar constructs. The parser code for `'label match` is based on `'label loop`, and that of `continue 'label value` on the `break 'label value` that can be found in labeled loops and labeled blocks. The `Continue` variant in expr types must be extended to hold an optional value, mirroring `break` which already supports a value.
+## Edge cases
 
-While the happy path appears straightforward, error messages need a careful look because they often assume loops, e.g.
+Behavior is as consistent as possible with labeled loops and labeled blocks. 
+
+**not implicit**
+
+A bare `break` or `continue` without a label never target a `match` (or block): bare `break` and `continue` always target loops.
+To target a `match`, the label is required, and omitting the label produces an error similar to the one generated by labeled blocks, e.g.
 
 ```rust
-fn foo() {
-    continue 'label 42
+match state {
+    A => continue B,
+    B => ...
 }
 ```
 
-gives the error "continue outside of a loop"
+This snippet will throw an error that is similar to the one already generated for `break` outside of a loop or labeled block:
 
 ```
-error[E0268]: `continue` outside of a loop
- --> src/lib.rs:3:15
   |
-3 |         continue 'label,
-  |         ^^^^^^^^^^^^^^^ cannot `continue` outside of a loop
+4 |             continue B,
+  |             ^^^^^^^^^^ cannot `continue` outside of a loop or labeled match
+  |
 ```
 
-That is no longer accurate, and needs rephrasing.
+**not ambiguous**
 
-### interaction with loops
-
-The rules that are already in place for labeled blocks will be followed when it comes to ambious targets. E.g. this snippet generates an error
+The rules that are already in place for labeled blocks will be followed when it comes to ambiguous targets. E.g. this snippet generates an error
 
 ```rust
     loop {
@@ -405,27 +410,56 @@ This labeled match would generate a similar error
     }
 ```
 
-Next, like labeled blocks, the target of a `break` or `continue` is never implicitly a `match`, in other words, this is rejected
+**in scope**
+
+A labeled match can be targeted by a `break` and `continue` when the label is in scope. That means that, though unlikely to be of practical value, these snippets are valid. 
 
 ```rust
-match state {
-    A => continue B,
-    B => ...
+let _: () = 'foo: match break 'foo {};
+
+'bar: match 1u8 {
+    x if continue 'bar 42 => unreachable!(),
+    _ => todo!()
 }
 ```
 
-with an error that is similar to the one already generated for `break` outside of a loop or labeled block
+This behavior is similar to loops, where e.g. this is a valid rust expression 
+
+```rust
+'foo: while break 'foo {}
+```
+
+## Implementation notes
+
+A proof of concept of this RFC has already been implemented, to verify that 1) the approach is feasible and 2) achieves the code generation we desire. The parts that are relevant for the reference are straightforward to implement, because they mirror existing constructs (labeled loops and blocks). The final lowering of `continue 'label value` needs further refinement, but is already extremely effective.
+
+### Parsing
+
+The parser already has infrastructure in place to parse very similar constructs. The parser code for `'label match` is based on `'label loop`, and that of `continue 'label value` on the `break 'label value` that can be found in labeled loops and labeled blocks. The `Continue` variant in expr types must be extended to hold an optional value, mirroring `break` which already supports a value.
+
+While the happy path appears straightforward, error messages need a careful look because they often assume loops, e.g.
+
+```rust
+fn foo() {
+    continue 'label 42
+}
+```
+
+gives the error "continue outside of a loop"
 
 ```
+error[E0268]: `continue` outside of a loop
+ --> src/lib.rs:3:15
   |
-4 |             continue B,
-  |             ^^^^^^^^^^ cannot `continue` outside of a loop or labeled match
-  |
+3 |         continue 'label,
+  |         ^^^^^^^^^^^^^^^ cannot `continue` outside of a loop
 ```
+
+That is no longer accurate, and needs rephrasing.
 
 ### type checking
 
-The changes appear straightforward. The only real addition is that the type of the `match` scrutinee matches the `continue` operand, i.e. the types of `expr1` and `expr2` must match in
+The changes should be straightforward, although they were skipped in the PoC. The only real addition is that the type of the `match` scrutinee matches the `continue` operand, i.e. the types of `expr1` and `expr2` must match in
 ```rust
 'label match expr1 {
     pat => continue 'label expr2
@@ -435,7 +469,7 @@ The changes appear straightforward. The only real addition is that the type of t
 
 ### borrow checking
 
-Borrow checking is implemented on MIR, so no specific changes are needed. But, again, error messages will need a careful look
+Borrow checking is implemented on MIR, so no specific changes are needed from a correctness perspective. But because labeled match can create loop-like control flow, there are new error cases that need some specific care. 
 
 ### hir -> mir lowering
 
@@ -722,28 +756,126 @@ The feature proposed in https://internals.rust-lang.org/t/pre-rfc-safe-goto-with
 
 The advantage of labeled match is that it is not as syntactically experimental. No new constructs or keywords are really needed, we "just" allow labels before match, and add an operand to `continue` just like `break` already has. Labeled match fits into current rust nicely, while being just as expressive.
 
+## Computed goto
+
+A feature of some C compilers where syntax is provided for creation of jump tables. E.g. 
+
+```c
+int interp_cgoto(unsigned char* code, int initval) {
+    /* The indices of labels in the dispatch_table are the relevant opcodes
+    */
+    static void* dispatch_table[] = {
+        &&do_halt, &&do_inc, &&do_dec, &&do_mul2,
+        &&do_div2, &&do_add7, &&do_neg};
+    #define DISPATCH() goto *dispatch_table[code[pc++]]
+
+    int pc = 0;
+    int val = initval;
+
+    DISPATCH();
+    while (1) {
+        do_halt:
+            return val;
+        do_inc:
+            val++;
+            DISPATCH();
+        do_dec:
+            val--;
+            DISPATCH();
+        do_mul2:
+            val *= 2;
+            DISPATCH();
+        do_div2:
+            val /= 2;
+            DISPATCH();
+        do_add7:
+            val += 7;
+            DISPATCH();
+        do_neg:
+            val = -val;
+            DISPATCH();
+    }
+}
+```
+
+[source](https://eli.thegreenplace.net/2012/07/12/computed-goto-for-efficient-dispatch-tables)
+
+There are two reasons one might use a computed goto 
+
+- get better code generation than the standard "loop + match" 
+- indexing into an array of future states is more natural than a match
+
+However, labeled match promises even better code generation than the jump table that computed goto produces in cases where targets are compile-time known, and has roughly similar ergonomics, e.g. 
+
+```rust
+macro_rules! dispatch() {
+    () => { 
+        let temp = code[pc]; // or .get_unchecked
+        pc += 1;
+        temp
+    }
+}
+
+'top: match dispatch!() {
+    DO_HALT => break 'top val,
+    DO_INC => { 
+        val += 1;
+        continue 'top dispatch!();
+    DO_DEC => {
+        val -= 1;
+        continue 'top dispatch!();
+    }
+    DO_MUL2 => {
+        val *= 2;
+        continue 'top dispatch!();
+    }
+    DO_DIV2 => {
+        val /= 2;
+        continue 'top dispatch!();
+    }
+    DO_ADD7 => {
+        val += 7;
+        continue 'top dispatch!();
+    }
+    DO_NEG => { 
+        val = -val;
+        continue 'top dispatch!();
+    }
+    _ => unreachable!(), // or unreachable_unchecked()
+}
+```
+
+LLVM appears to reliably translate this code into a jump table.
+
 ## improve MIR optimizations
 
 In theory, more sophisiticated analysis of the MIR should be able to optimize the "loop + match" pattern into a collection of unconditional jumps. We've seen that it's not capable of performing this optimization today, but if it could, then maybe labeled match would not be needed.
 
-I'm sceptical that, in general, the need for labeled match would go away entirely:
+While improvements to rust's MIR passes are certainly possible, limitations are:
 
-- LLVM cannot perform this optimization either (MIR does have more information but still)
-- Optimization pipelines are unreliable: they can break when the input function is too large, or too complex.
+- the implementation complexity
+- the compile time cost 
+- analysis is fragile
 
-Labeled match reliably gives the desired codegen in almost all cases. An unconditional jump is not a hard guarantee, but the situation is similar to tail-call elimination in languages that have it: if you write your code a certain way, you can actually be sure of the optimization.
+In contrast
+
+- labeled match is a desugaring no more complex than labeled loops and blocks
+- the transformation is syntactic, and therefore nicely bounded
+- programmers can write their code in such a way that they can be confident the desugaring to a `goto` kicks in 
+
+So, labeled match is a solid way to make progress on better codegen. Improved optimizations on MIR are also very welcome, but never entirely remove the need for labeled match from a programmer's perspective.
 
 ## Labeled match
 
-That brings us to this proposal, the labeled match.
+Finally, let's summarize labeled match.
 
-The labeled match proposal combines existing rust features of match and labeled blocks/loops. It is just the interaction between these concepts that has to be learned, no new keywords or syntactic constructions are needed.
+The labeled match proposal combines existing rust features of `match` and labeled blocks/loops. It is just the interaction between these concepts that has to be learned, no new keywords or syntactic constructions are needed. Occurences of labeled match will be rare, and true beginners are unlikely to encounter them early on.
 
-Labeled match is not blocked on LLVM, and can be implemented entirely in rustc, providing benefits to all code generation backends.
+Labeled match does not introduce arbitrary control flow (like general `goto`) or surprising implicit control flow (like `switch` fallthrough in C and descendants). The mechanism fits nicely into how rust works today.
 
-Labeled match does not introduce arbitrary control flow (like general `goto`) or surprising implicit control flow (like `switch` fallthrough in C and descendants).
+Labeled match is not blocked on LLVM, and can be implemented entirely in rustc, providing benefits to all code generation backends. The implementation and maintainence effort is small, because infrastructure that is already in place for labeled loops and blocks is reused.
 
-The codegen characteristics provided by labeled match are essential in real-world programs, like [`zlib-rs`](https://github.com/memorysafety/zlib-rs). The inability to generate efficient code actively limits the adoption of rust in domains where performance is key. Without a feature like this, it is effectively impossible to beat C in certain cases.
+The codegen characteristics provided by labeled match are essential in real-world programs, like [`zlib-rs`](https://github.com/memorysafety/zlib-rs). Improvements other MIR optimizations are welcome, but unlikely to reliable give the desired codegen. The inability to generate efficient code actively limits the adoption of rust in domains where performance is key. Without a feature like this, it is effectively impossible to beat C in certain cases.
 
 # Prior art
 [prior-art]: #prior-art
@@ -757,9 +889,23 @@ The idea was first introduced in [this issue](https://github.com/ziglang/zig/iss
 # Unresolved questions
 [unresolved-questions]: #unresolved-questions
 
-- What parts of the design do you expect to resolve through the RFC process before this gets merged?
-- What parts of the design do you expect to resolve through the implementation of this feature before stabilization?
-- What related issues do you consider out of scope for this RFC that could be addressed in the future independently of the solution that comes out of this RFC?
+**What parts of the design do you expect to resolve through the RFC process before this gets merged?**
+
+The semantics of `'label: match`, `continue 'label value` and `break 'label value`, including any edge cases or error messages that have been missed so far.
+
+The RFC text provides background on why this feature is needed for improved code generation, but from the language perspective, only the above three elements are required.
+The exact details of the HIR to MIR lowering can be figured out through the implemenation.
+
+**What parts of the design do you expect to resolve through the implementation of this feature before stabilization?**
+
+The happy path of HIR to MIR specialization is clear, but there are some questions around what to do when `continue 'label value` does not obviously match a branch. That can be the case if `value` is truly only known at runtime, or if inlining is needed before the jump target can be known. Detailed benchmarking, and investigating the interaction with other MIR optimizations will be required to figure out what the best approach is in all cases.
+
+**What related issues do you consider out of scope for this RFC that could be addressed in the future independently of the solution that comes out of this RFC?**
+
+None so far
+
 
 # Future possibilities
 [future-possibilities]: #future-possibilities
+
+None so far
