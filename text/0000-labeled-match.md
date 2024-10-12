@@ -6,7 +6,7 @@
 # Summary
 [summary]: #summary
 
-This RFC adds labeled match: a `match` can be labeled, and be targeted by a `continue` that takes a single operand. This value is treated as a replacement operand to the `match` expression.
+This RFC adds labeled match: a `match` can be labeled, and be targeted by a `continue` that takes a single operand. This value is treated as a replacement operand to the `match` expression. Labeled match is useful when writing state machines, and in cases where C uses fallthroughs from one switch branch to another.
 
 This construct is similar to a `match` inside of a loop, with a mutable variable being updated to move to the next state. For instance, these two functions are semantically equivalent:
 
@@ -40,12 +40,87 @@ The goal of labeled match is improved ergonomics and codegen for state machines.
 
 ## Ergonomics
 
-State machines require fairly flexible control flow. However, the unstructured control flow of C is in many ways too flexible: it is hard for programmers to understand and for tools (e.g. the borrow checker) to reason about and give good errors for. We have to find a middle ground between code that is easy to understand (by human and machine), interacts well with other rust features, and flexible enough to efficiently express state machine logic.
+State machines require fairly flexible control flow. However, the unstructured control flow of C is in many ways too flexible: it is hard for programmers to understand and for tools (e.g. the borrow checker) to reason about and give good errors for. Ideally, there is a middle ground between code that is easy to understand (by human and machine), interacts well with other rust features, and is flexible enough to efficiently express state machine logic.
 
-Today, the choice is often between a readable, but inefficient implementation (see below), or a complex unreadable version (featuring nested labeled blocks and loops). Labeled match provides meaningfully more expresivity, while staying very close to existing rust concepts.
+Today there is no good way to translate C code that uses implicit fallthroughs or similar control flow to rust while preserving both the ergonomics (in particular, the number of levels of indentation) and the performance (due to LLVM using jump tables instead of an unconditional jump, see the next section):
 
-A niche, but very valuable use case is [c2rust](https://github.com/immunant/c2rust). The sort of C code base where c2rust is used often uses "cursed" control flow, like switch branches implicitly falling through, or even explicit `goto` statements. Being able to lower these, in most cases, to a labeled match greatly improves both the readability of the generated code, speeding up the porting process.
+```c
+switch (a) {
+    case 1:
+        i += 1;
+        /* implicit fallthrough */
+    case 2:
+        i += 1;
+        break;
+    default:
+}
+```
 
+We could try a solution with nested labeled blocks, but it scales very poorly in the number of states:
+
+```rust
+'done: {
+    'case_2: {
+        'case_1: {
+            match a {
+                1 => break 'case_1,
+                2 => break 'case_2,
+                _ => break 'done,
+            }
+        }
+
+        i += 1;
+        /* implicit fallthrough */
+    }
+
+    i += 1;
+    break 'done;
+};
+```
+
+This does not spark joy.
+
+Alternatively, we could try to introduce a loop
+
+```rust
+let mut a = a;
+loop {
+    match a {
+        1 => {
+            i += 1;
+            a = 2;
+            continue;
+        }
+        2 => {
+            i += 1;
+            break;
+        }
+        _ => break,
+    }
+}
+```
+
+This keeps indentation flat, and it is much easier to understand the cotrol flow. But (in general) this loop version is less efficient than the original C code, because the transition between states is not always a direct jump, even if the compiler in theory could know exactly what the next block of code to execute is (again, see the next section for details).
+
+Labeled match solves both the ergonomics issue and makes reliably generating efficient code much easier:
+
+```rust
+'top: match a {
+    1 => {
+        i += 1;
+        continue 'top 2;
+    }
+    2 => {
+        i += 1;
+        break 'top;
+    }
+    _ => break 'top,
+}
+```
+
+One could argue that the inability to directly translate switch fallthrough into rust is an instance of the [XY problem](https://xyproblem.info/), but many parsers, interpreters and other state machines just rely on this kind of control flow.
+
+A niche, but very valuable use case is [c2rust](https://github.com/immunant/c2rust), a tool that automatically translates C to rust. In many cases, a C `switch` cannot be automatically translated to a rust `match` due to implicit fallthroughs, so the translation produces an abomination of labeled blocks and loops: correct, but hard to reason about. Being able to lower such control flow, in most cases, to a labeled match greatly improves both the readability of the generated code, speeding up the porting process.
 
 Many other parser, decoder and other lowlevel crates will similarly benefit from the ergonomics of labeled match.
 
@@ -69,7 +144,7 @@ loop {
 }
 ```
 
-While this is a natural way to express a state machine, it is well-known that when translated to machine code in a straightforward way, this approach is inefficient on modern CPUs: the match is an unpredictable branch, causing many branch misses. Reducing the number of branch misses is crucial for good performance on modern hardware. A proof of concept implementation shows considerable performance gains versus current recommended workarounds in real-world scenarios:
+While this is a natural way to express a state machine, it is well-known that when translated to machine code in a straightforward way, this approach is inefficient on modern CPUs: the match is an unpredictable branch, causing many branch misses. Reducing the number of branch misses is crucial for good performance on modern hardware. A proof of concept implementation of labeled match shows considerable performance gains versus current recommended workarounds in real-world scenarios:
 
 ```
 Benchmark 2 (77 runs): target/release/examples/blogpost-uncompress rs-chunked 4 silesia-small.tar.gz
