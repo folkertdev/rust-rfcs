@@ -6,9 +6,13 @@
 # Summary
 [summary]: #summary
 
-This RFC adds labeled match: a `match` can be labeled, and be targeted by a `continue` that takes a single operand. This value is treated as a replacement operand to the `match` expression. Labeled match is useful when writing state machines, and in cases where C uses fallthroughs from one switch branch to another.
+This RFC adds labeled match:
 
-This construct is similar to a `match` inside of a loop, with a mutable variable being updated to move to the next state. For instance, these two functions are semantically equivalent:
+- a `match` can be labeled: `'label: match x { ... }`
+- a labeled match can targeted by a `continue 'label value`. The `value` is treated as a replacement operand to the `match` expression.
+- a labeled match can targeted by a `break 'label value`. The `value` becomes the value of the whole `match` expression
+
+Labeled match is similar to a `match` inside of a loop, with a mutable variable being updated to move to the next state. For instance, these two functions are semantically equivalent:
 
 ```rust
 fn labeled_switch() -> Option<u8> {
@@ -40,9 +44,9 @@ The goal of labeled match is improved ergonomics and codegen for state machines.
 
 ## Ergonomics
 
-State machines require fairly flexible control flow. However, the unstructured control flow of C is in many ways too flexible: it is hard for programmers to understand and for tools (e.g. the borrow checker) to reason about and give good errors for. Ideally, there is a middle ground between code that is easy to understand (by human and machine), interacts well with other rust features, and is flexible enough to efficiently express state machine logic.
+State machines require fairly flexible control flow. However, the unstructured control flow of C is in many ways too flexible: it is hard for programmers to follow and for tools to reason about and give good errors for. Ideally, there is a middle ground between code that is easy to understand (by human and machine), interacts well with other rust features, and is flexible enough to efficiently express state machine logic.
 
-Today there is no good way to translate C code that uses implicit fallthroughs or similar control flow to rust while preserving both the ergonomics (in particular, the number of levels of indentation) and the performance (due to LLVM using jump tables instead of an unconditional jump, see the next section):
+Today there is no good way to translate C code that uses implicit fallthroughs or similar control flow to rust while preserving both the ergonomics (in particular, the number of levels of indentation) and the performance (due to LLVM using jump tables instead of an unconditional jump, see the next section). If we wanted to translate this C code to Rust:
 
 ```c
 switch (a) {
@@ -100,7 +104,7 @@ loop {
 }
 ```
 
-This keeps indentation flat, and it is much easier to understand the cotrol flow. But (in general) this loop version is less efficient than the original C code, because the transition between states is not always a direct jump, even if the compiler in theory could know exactly what the next block of code to execute is (again, see the next section for details).
+This keeps indentation flat, and it is much easier to understand the control flow. But (in general) this loop version is less efficient than the original C code, because the transition between states is not always a direct jump, even if the compiler in theory could know exactly what the next block of code to execute is (again, see the next section for details).
 
 Labeled match solves both the ergonomics issue and makes reliably generating efficient code much easier:
 
