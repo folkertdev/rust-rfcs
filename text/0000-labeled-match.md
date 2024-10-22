@@ -37,7 +37,7 @@ fn emulate_labeled_switch() -> Option<u8> {
 }
 ```
 
-The following sections go into why this feature is essential for writing efficient state machines, looking both at ergonomics and performance. A proof of concept of this feature is available
+The following sections go into why this feature is essential for writing efficient state machines, looking both at ergonomics and performance. See [the implementation notes](#Implementation-notes) for instructions on running our proof-of-concept implementation.
 
 # Motivation
 [motivation]: #motivation
