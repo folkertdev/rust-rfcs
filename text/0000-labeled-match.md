@@ -37,14 +37,16 @@ fn emulate_labeled_switch() -> Option<u8> {
 }
 ```
 
+The following sections go into why this feature is essential for writing efficient state machines, looking both at ergonomics and performance. A proof of concept of this feature is available
+
 # Motivation
 [motivation]: #motivation
 
-The goal of labeled match is improved ergonomics and codegen for state machines. Rust being as systems language should be good at writing efficient state machines, and currently falls short. Complex state machines are niche, but extremely important.
+The goal of labeled match is improved ergonomics and codegen for state machines. Rust being as systems language should be good at writing efficient state machines, and currently falls short. Complex state machines are niche, but foundational to many programs (parsers, interpreters, networking protocols).
 
 ## Ergonomics
 
-State machines require fairly flexible control flow. However, the unstructured control flow of C is in many ways too flexible: it is hard for programmers to follow and for tools to reason about and give good errors for. Ideally, there is a middle ground between code that is easy to understand (by human and machine), interacts well with other rust features, and is flexible enough to efficiently express state machine logic.
+State machines require flexible control flow. However, the unstructured control flow of C is in many ways too flexible: it is hard for programmers to follow and for tools to reason about and give good errors for. Ideally, there is a middle ground between code that is easy to understand (by human and machine), interacts well with other rust features, and is flexible enough to efficiently express state machine logic.
 
 Today there is no good way to translate C code that uses implicit fallthroughs or similar control flow to rust while preserving both the ergonomics (in particular, the number of levels of indentation) and the performance (due to LLVM using jump tables instead of an unconditional jump, see the next section). If we wanted to translate this C code to Rust:
 
@@ -120,6 +122,17 @@ Labeled match solves both the ergonomics issue and makes reliably generating eff
     }
     _ => break 'top,
 }
+
+// or even
+
+'top: match a {
+    1 => {
+        i += 1;
+        continue 'top 2;
+    }
+    2 => i += 1,
+    _ => {}
+}
 ```
 
 One could argue that the inability to directly translate switch fallthrough into rust is an instance of the [XY problem](https://xyproblem.info/), but many parsers, interpreters and other state machines just rely on this kind of control flow.
@@ -148,7 +161,12 @@ loop {
 }
 ```
 
-While this is a natural way to express a state machine, it is well-known that when translated to machine code in a straightforward way, this approach is inefficient on modern CPUs: the match is an unpredictable branch, causing many branch misses. Reducing the number of branch misses is crucial for good performance on modern hardware. A proof of concept implementation of labeled match shows considerable performance gains versus current recommended workarounds in real-world scenarios:
+While this is a natural way to express a state machine, it is well-known that when translated to machine code in a straightforward way, this approach is inefficient on modern CPUs:
+
+- The match is an unpredictable branch, causing many branch misses. Reducing the number of branch misses is crucial for good performance on modern hardware.
+- The "loop + match" approach contains control flow paths (so, sequences of branches) that will never be taken in practice. The stack can be smaller if the control flow paths are known more precisely.
+
+By providing the compiler with more knowlege about what state transitions actually exists (i.e. what other states can follow a particular state), we get major performance improvements. A proof of concept implementation of labeled match shows considerable performance gains versus current recommended workarounds in real-world scenarios:
 
 ```
 Benchmark 2 (77 runs): target/release/examples/blogpost-uncompress rs-chunked 4 silesia-small.tar.gz
@@ -159,7 +177,7 @@ Benchmark 2 (77 runs): target/release/examples/blogpost-uncompress rs-chunked 4 
   instructions        710M  ±  301       710M  …  710M           0 ( 0%)        ⚡- 22.5% ±  0.0%
 ```
 
-The specific proposal in this RFC is that lowering `continue 'label value` from HIR to MIR inserts an unconditional branch (`goto`) when the target is known. Hence, the programmer can structure their program so that this improved lowering kicks in. Of course later MIR passes and the codegen backend are free to optimize from that point as they see fit. Therefore no guarantees can be made about the exact shape of the final assembly.
+The specific proposal in this RFC is that lowering `continue 'label value` from HIR to MIR inserts an unconditional branch (`goto`) when the target is known. Hence, the programmer can structure their program so that this improved lowering kicks in. Of course later MIR passes and the codegen backend are free to optimize from that point as they see fit. Therefore no guarantees can be made about the exact shape of the final MIR and assembly.
 
 ## Doesn't LLVM optimize this already?
 
@@ -445,7 +463,7 @@ The changes to the language are:
 
 - we allow labeling of `match` expressions: `'label: match scrutinee { ... }`
 - `break 'label <operand>` expressions can target the labeled match, giving the whole match expression the value of `<operand>`
-- `continue 'label <operand>` expressions can target the labeled match, replacing `scrutinee` with `<operand>` and proceding to the correct match branch
+- `continue 'label <operand>` expressions can target the labeled match, replacing `scrutinee` with `<operand>` and proceeding to the correct match branch
 
 ## Edge cases
 
@@ -474,7 +492,7 @@ This snippet will throw an error that is similar to the one already generated fo
 
 **not ambiguous**
 
-The rules that are already in place for labeled blocks will be followed when it comes to ambiguous targets. E.g. this snippet generates an error
+The rules that are already in place for labeled blocks will be followed when it comes to ambiguous targets. E.g. this snippet generates an error today
 
 ```rust
     loop {
@@ -523,11 +541,15 @@ This behavior is similar to loops, where e.g. this is a valid rust expression
 
 ## Implementation notes
 
-A proof of concept of this RFC has already been implemented, to verify that 1) the approach is feasible and 2) achieves the code generation we desire. The parts that are relevant for the reference are straightforward to implement, because they mirror existing constructs (labeled loops and blocks). The final lowering of `continue 'label value` needs further refinement, but is already extremely effective.
+A proof of concept of this RFC has already been implemented, to verify that 1) the approach is feasible and 2) achieves the code generation we desire. This implementation can be found at https://github.com/trifectatechfoundation/rust/tree/labeled-match.
+
+See [this gist](https://gist.github.com/folkertdev/977183fb706b7693863bd7f358578292) for some benchmarks comparing tail calls, loop + match and labeled match.
+
+It turns out that parts that are relevant for the reference are straightforward to implement, because they mirror existing constructs (labeled loops and blocks). The final lowering of `continue 'label value` needs further refinement, but is already extremely effective.
 
 ### Parsing
 
-The parser already has infrastructure in place to parse very similar constructs. The parser code for `'label match` is based on `'label loop`, and that of `continue 'label value` on the `break 'label value` that can be found in labeled loops and labeled blocks. The `Continue` variant in expr types must be extended to hold an optional value, mirroring `break` which already supports a value.
+The parser already has infrastructure in place to parse very similar constructs. The parser code for `'label: match` is based on `'label: loop`, and that of `continue 'label value` on the `break 'label value` that can be found in labeled loops and labeled blocks. The `Continue` variant in expr types must be extended to hold an optional value, mirroring `break` which already supports a value.
 
 While the happy path appears straightforward, error messages need a careful look because they often assume loops, e.g.
 
@@ -690,7 +712,7 @@ And then perform constant propagation into the `switchInt`, so that we get
 
 Today, MIR optimizations are apparently not capable of simplifying the above into a `goto`. Even if they were, it is probably still beneficial to perform a check to see whether a `goto` can be inserted immediately during lowering, rather than relying on MIR optimizations to eventually come to that same conclusion. Having the MIR optimizer do the dirty work is both inefficient and may limit further analysis because the naive desugaring introduces control flow paths that are not actually used in practice.
 
-Of course, it may not be possible to pick the right branch at this point. Maybe the value is truly only known at runtime, or some amount of inlining needs to occcur before the value can be known. In experiments so far, duplicating the match does not leed to duplicated code in the final assembly. But more experimentation is needed: maybe a lowering to the standard "loop + match" is better in some cases.
+Of course, it may not be possible to pick the right branch at this point. Maybe the value is truly only known at runtime, or some amount of inlining needs to occcur before the value can be known. In experiments so far, duplicating the match does not lead to duplicated code in the final assembly. But more experimentation is needed: maybe a lowering to the standard "loop + match" is better in some cases.
 
 This basic lowering does not consider nested patterns, but does appear to work well with e.g. patterns with guards. As an initial version, this likely already covers the vast majority of cases. Further improvements to the code generation can be implemented incrementally.
 
@@ -957,7 +979,7 @@ In contrast
 
 So, labeled match is a solid way to make progress on better codegen. Improved optimizations on MIR are also very welcome, but never entirely remove the need for labeled match from a programmer's perspective.
 
-## Labeled match
+## Why Labeled match is the best solution
 
 Finally, let's summarize labeled match.
 
@@ -991,6 +1013,8 @@ The exact details of the HIR to MIR lowering can be figured out through the impl
 **What parts of the design do you expect to resolve through the implementation of this feature before stabilization?**
 
 The happy path of HIR to MIR specialization is clear, but there are some questions around what to do when `continue 'label value` does not obviously match a branch. That can be the case if `value` is truly only known at runtime, or if inlining is needed before the jump target can be known. Detailed benchmarking, and investigating the interaction with other MIR optimizations will be required to figure out what the best approach is in all cases.
+
+We may also want to desugar differently based on the optimization level (in particular when optimizing for binary size). Again this will require experimentation.
 
 **What related issues do you consider out of scope for this RFC that could be addressed in the future independently of the solution that comes out of this RFC?**
 
