@@ -734,7 +734,7 @@ Today, MIR optimizations are apparently not capable of simplifying the above int
 
 Of course, it may not be possible to pick the right branch at this point. Maybe the value is truly only known at runtime, or some amount of inlining needs to occcur before the value can be known. In experiments so far, duplicating the match does not lead to duplicated code in the final assembly. But more experimentation is needed: maybe a lowering to the standard "loop + match" is better in some cases.
 
-This basic lowering does not consider nested patterns, but does appear to work well with e.g. patterns with guards. As an initial version, this likely already covers the vast majority of cases. Further improvements to the code generation can be implemented incrementally.
+This basic lowering appears to work well for most basic forms of patterns, e.g. `Foo`, `Foo(x)`, `Foo(x) | Bar(x)` and `Foo(x) if y`. Nested patterns of the form `Foo(Bar(x))` don't generate optimal code, only the outer match is short-circuited. As an initial version, this likely already covers the vast majority of cases. Further improvements to the code generation can be implemented incrementally.
 
 # Drawbacks
 [drawbacks]: #drawbacks
