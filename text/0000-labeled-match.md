@@ -537,6 +537,28 @@ This behavior is similar to loops, where e.g. this is a valid rust expression
 'foo: while break 'foo {}
 ```
 
+**independent of branch ordering**
+
+A `continue 'label value` has the same behavior independent of branch ordering. In other words, these two variations are equivalent:
+
+```rust
+'label: match scrutinee {
+    Foo => {}
+    Bar => {
+        // some work
+        continue 'label Foo;
+    }
+}
+
+'label: match scrutinee {
+    Bar => {
+        // some work
+        continue 'label Foo;
+    }
+    Foo => {}
+}
+```
+
 ## Implementation notes
 
 A proof of concept of this RFC has already been implemented, to verify that 1) the approach is feasible and 2) achieves the code generation we desire. This implementation can be found at https://github.com/trifectatechfoundation/rust/tree/labeled-match.
