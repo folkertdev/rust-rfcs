@@ -44,6 +44,13 @@ The following sections go into why this feature is essential for writing efficie
 
 The goal of labeled match is improved ergonomics and codegen for state machines. Rust being as systems language should be good at writing efficient state machines, and currently falls short. Complex state machines are niche, but foundational to many programs (parsers, interpreters, networking protocols).
 
+This RFC follows in part from work on [zlib-rs](https://github.com/trifectatechfoundation/zlib-rs). The decompression logic of zlib is a large state machine. The C version relies heavily on:
+
+- putting values onto the stack (rather than behind a heap-allocated pointer). In practice, LLVM is a lot better at reasoning about stack values, resulting in better optimizations
+- guaranteed direct jumps between different states, using the fallthrough behavior of C `switch` statements
+
+Today, we simply cannot achieve the same codegen as C implementations. This limitation actively harms the adoption of rust in high-performance areas like compression.
+
 ## Ergonomics
 
 State machines require flexible control flow. However, the unstructured control flow of C is in many ways too flexible: it is hard for programmers to follow and for tools to reason about and give good errors for. Ideally, there is a middle ground between code that is easy to understand (by human and machine), interacts well with other rust features, and is flexible enough to efficiently express state machine logic.
@@ -388,15 +395,6 @@ LLVM has generated a jump table, and all state transitions go via this jump tabl
 ```
 
 As a programmer, we have no control over this process. Adding one extra state transition to your program, or making some other small change, can thus cause a major performance regression.
-
-## real-world use cases
-
-Performant state machines are important in real-world projects. This RFC follows in part from work on [zlib-rs](https://github.com/trifectatechfoundation/zlib-rs). The decompression logic of zlib is a large state machine. The C version relies heavily on:
-
-- putting values onto the stack (rather than behind a heap-allocated pointer). In practice, LLVM is a lot better at reasoning about stack values, resulting in better optimizations
-- guaranteed direct jumps between different states, using the fallthrough behavior of C `switch` statements
-
-Today, we simply cannot achieve the same codegen as C implementations. This limitation actively harms the adoption of rust in high-performance areas like compression.
 
 # Guide-level explanation
 [guide-level-explanation]: #guide-level-explanation
