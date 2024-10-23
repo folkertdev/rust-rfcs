@@ -799,7 +799,7 @@ let mut n = count.div_ceil(4);
 
 The dedicated programmer can use labeled blocks to simulate the C fallthrough behavior.
 
-One downside of labeled blocks is that it scales poorly: each state needs its own scope, adding at least one level of indentation.
+But labeled blocks scale poorly in the number of states: each state needs its own scope, adding at least one level of indentation.
 Following the control flow is tricky, especially because there are now implicit fallthroughs between states.
 Compare these semantically equivalent implementations:
 
@@ -845,7 +845,7 @@ Nested labeled blocks do not spark joy.
 
 Macros can be used to tame the syntactic complexity to some extent, but that just introduces custom syntax to learn for something as fundamental to a low level programming language as a state machine. Furthermore, editor experience within macros is still not as good as for first-class language constructs.
 
-The second limitation is that only forward jumps (from an earlier to a later branch) are possible. To go back to an earlier branch, a loop and unpredictable match are still required. Thus, labeled match wins in brevity, expressivity and code generation quality.
+A second limitation is that only forward jumps (from an earlier to a later branch) are possible. To go back to an earlier branch, a loop and unpredictable match are still required. Thus, labeled match wins in brevity, expressivity and code generation quality.
 
 ## guaranteed tail calls
 
