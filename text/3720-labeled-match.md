@@ -58,10 +58,10 @@ loop {
 }
 ```
 
-Reading the code, it is obvious that state moves from states `Foo` to `Bar` to `Baz`: no other path is possible. Specifically, we cannot end up in `State::Bar` twice, and hence the generated "use of moved value" error is not a problem in practice. With `loop match const` and `const continue` the compiler now understands the control flow:
+Reading the code, it is obvious that state moves from states `Foo` to `Bar` to `Baz`: no other path is possible. Specifically, we cannot end up in `State::Bar` twice, and hence the generated "use of moved value" error is not a problem in practice. With `loop const match` and `const continue` the compiler now understands the control flow:
 
 ```rust
-loop match const State::Foo {
+loop const match State::Foo {
     State::Foo => const continue State::Bar,
     State::Bar => {
         // or any function that moves the value
@@ -480,12 +480,12 @@ fn loop_plus_match() -> Option<u8> {
 So far `loop match` is just syntax sugar. Its power lies in a combination with the `const` keyword, that provides the compiler with more accurate
 information about the control flow of your program.
 
-For example, this program is valid because with `loop match const` and `const continue` all paths that makes it to the `false` branch will have initialized the `x` variable:
+For example, this program is valid because with `loop const match` and `const continue` all paths that makes it to the `false` branch will have initialized the `x` variable:
 
 ```rust
 let x: u64;
 
-loop match const true {
+loop const match true {
     true => {
         x = 42;
         const continue false;
@@ -519,7 +519,7 @@ loop {
 Reading the code, it is obvious that state moves from states `Foo` to `Bar` to `Baz`: no other path is possible. Specifically, we cannot end up in `State::Bar` twice, and hence the generated "use of moved value" error is not a problem in practice. With `loop match` and `const continue` the compiler now understands the control flow:
 
 ```rust
-loop match const State::Foo {
+loop const match State::Foo {
     State::Foo => const continue State::Bar,
     State::Bar => {
         // or any function that moves the value
@@ -532,7 +532,7 @@ loop match const State::Foo {
 
 This more accurate understanding of control flow has advantages for the borrow checker, but also for other downstream compiler passes. 
 
-To use a `loop match const <expr>` or `const continue <expr>` expression, the `<expr>` must be [static-promotable](https://github.com/rust-lang/rfcs/pull/1414). 
+To use a `loop const match <expr>` or `const continue <expr>` expression, the `<expr>` must be [static-promotable](https://github.com/rust-lang/rfcs/pull/1414). 
 
 # Reference-level explanation
 [reference-level-explanation]: #reference-level-explanation
@@ -660,12 +660,12 @@ loop match read_next_byte() {
 }
 ```
 
-### `loop match const` and `const continue` can be freely mixed 
+### `loop const match` and `const continue` can be freely mixed 
 
-We can have a `loop match const` with non-const continues:
+We can have a `loop const match` with non-const continues:
 
 ```rust
-loop match const State::Start {
+loop const match State::Start {
     State::Start => continue next_state(),
     State::S2 => break,
     State::S3 => const continue State::S2,
