@@ -179,9 +179,9 @@ loop match a {
 
 One could argue that the inability to directly translate switch fallthrough into rust is an instance of the [XY problem](https://xyproblem.info/), but many parsers, interpreters and other state machines just rely on this kind of control flow.
 
-A niche, but very valuable use case is [c2rust](https://github.com/immunant/c2rust), a tool that automatically translates C to rust. In many cases, a C `switch` cannot be automatically translated to a rust `match` due to implicit fallthroughs, so the translation produces an abomination of labeled blocks and loops: semantically correct, but hard to reason about. Currently, such cases have to be [cleaned up by hand](https://github.com/trifectatechfoundation/libbzip2-rs/pull/25), which is error-prone. Being able to lower such control flow, in most cases, to a labeled match greatly improves both the readability of the generated code, speeding up the porting process.
+A niche, but very valuable use case is [c2rust](https://github.com/immunant/c2rust), a tool that automatically translates C to rust. In many cases, a C `switch` cannot be automatically translated to a rust `match` due to implicit fallthroughs, so the translation produces an abomination of labeled blocks and loops: semantically correct, but hard to reason about. Currently, such cases have to be [cleaned up by hand](https://github.com/trifectatechfoundation/libbzip2-rs/pull/25), which is error-prone. Being able to lower such control flow, in most cases, to a `loop match` greatly improves both the readability of the generated code, speeding up the porting process.
 
-Many other parser, decoder and other lowlevel crates will similarly benefit from the ergonomics of labeled match.
+Many other parser, decoder and other lowlevel crates will similarly benefit from the ergonomics of `loop match`.
 
 ## Code generation
 
@@ -208,7 +208,7 @@ While this is a natural way to express a state machine, it is well-known that wh
 - The match is an unpredictable branch, causing many branch misses. Reducing the number of branch misses is crucial for good performance on modern hardware.
 - The "loop + match" approach contains control flow paths (so, sequences of branches) that will never be taken in practice. More opimizations are possible if the actual possible paths are known more precicely (e.g. stack space can be reused if the value stored there will not be used in later states).
 
-By providing the compiler with more precise knowlege about what state transitions actually exists (i.e. what other states can follow a particular state), we get major performance improvements in practice. A proof of concept implementation of labeled match shows considerable performance gains versus current recommended workarounds in real-world scenarios ([all results](https://gist.github.com/folkertdev/977183fb706b7693863bd7f358578292):
+By providing the compiler with more precise knowlege about what state transitions actually exists (i.e. what other states can follow a particular state), we get major performance improvements in practice. A proof of concept implementation of `loop match` shows considerable performance gains versus current recommended workarounds in real-world scenarios ([all results](https://gist.github.com/folkertdev/977183fb706b7693863bd7f358578292):
 
 ```
 Benchmark 3 (80 runs): /tmp/labeled-match-len rs-chunked 4 silesia-small.tar.gz
@@ -625,14 +625,18 @@ error[E0000]: `continue` with value from a nested loop
 
 ### `const continue` must know where to jump
 
-It must be known at compile time which branch the operand of a `const continue <operand>` will jump to. If the value is not of the right form, it will be rejected:
+It must be known at compile time which branch the operand of a `loop const match <operand>` or `const continue <operand>` will jump to. 
+The rules are described [here](#restrictions-on-the-const-continue-operand).
+If the value is not of the right form, it will be rejected:
 
 ```rust
-extern "Rust" not_comptime_known() -> u8;
+extern "Rust"  [
+    fn not_comptime_known() -> u8;
+}
 
 loop match 1u8 {
     0 => break,
-    _ => const continue not_comptime_known(),
+    _ => const continue unsafe { not_comptime_known() },
 }
 ```
 
@@ -714,7 +718,7 @@ loop match None {
 
 Intuitively, a `goto` could be inserted to the `Some(_)` pattern (which does not exist in the surface language, but its equivalent is inserted by pattern match desugaring). However, dealing with partial patterns leaks information about the order in which patterns are evaluated. There's an ongoing discussion about whether rust can/should commit to a particular order or not. 
 
-Unfortunately, this snippet is also rejected even though here the desired behavior is clear. We just don't currently have an accurate way of describing that this snippet is valid and the one above is not, so we conservatively reject both.
+Unfortunately, the following snippet is also rejected even though here the desired behavior is clear. We just don't currently have an accurate way of describing that this snippet is valid and the one above is not, so we conservatively reject both.
 
 ```rust
 loop match None {
@@ -736,7 +740,7 @@ loop match None {
 ```
 
 
-Expanding the category of expressions that is accepted is therefore left as future work.
+Expanding the set of expressions that is accepted is therefore left as future work.
 
 ## Proof of Concept
 
@@ -746,7 +750,7 @@ See the [earlier version of this section](https://github.com/folkertdev/rust-rfc
 
 ## `HIR -> MIR` Lowering
 
-The meat of this proposal. The core idea is that a `const continue value` is desugared into a `goto` to the `match` branch that `value` matches.
+The meat of this proposal. The core idea is that `loop const match value` and `const continue value` are desugared into a `goto` to the `match` branch that `value` matches.
 
 ### Intuition
 
@@ -797,7 +801,7 @@ Produces this MIR today with `--release`. Assuming the initial state is `State::
 
 > NOTE: in theory, a MIR analysis pass should be able to simplify the control flow here. However those working on MIR optimizations [appear sceptical](https://rust-lang.zulipchat.com/#narrow/channel/131828-t-compiler/topic/improving.20rust.20codegen.20at.20the.20GOSIM.20unconf/near/478588328) that this would be a good idea.
 
-The proposed labeled match code
+The proposed `loop match` code
 
 ```rust
 enum State {A, B }
@@ -893,6 +897,47 @@ And then perform constant propagation into the `switchInt`, so that we get
 
 The restrictions on `const continue` mean that we can always desugar to a `goto`.
 
+### Lowering Details: `loop const match`
+
+A `loop const match <operand>` jumps directly to the branch that matches `<operand>`. E.g.   
+
+```rust
+loop match State::A {
+    State::A => {
+        // perform work
+        const continue State::B;
+    }
+    State::B => {
+        break 42
+    }
+};
+``` 
+
+will desugar into (roughly)
+
+
+```
+    bb1: {
+        goto -> bb4;
+    }
+
+    bb2: {
+        unreachable;
+    }
+
+    bb3: {
+        StorageDead(_2);
+        return;
+    }
+
+    bb4: {
+        _2 = const State::B;
+        goto -> bb3;
+    }
+```
+
+because all branches either diverge or perform a direct jump to a next state, the match is completely elided in this case.
+
 ## Implications for borrow checking
 
 Because `const continue` is desugared to a `goto` when HIR is lowered to MIR, the more precise control flow information is available to the borrow checker. Hence more programs are accepted that would otherwise be rejected with an error like:
@@ -911,16 +956,14 @@ error[E0382]: use of moved value: `owned`
    |                  ^^^^^ value moved here, in previous iteration of loop
 ```
 
-The borrow checker already operates on basic blocks, so no specific changes are needed.
+The borrow checker already operates on basic blocks, and [can handle irreducable control flow](https://rust-lang.zulipchat.com/#narrow/channel/186049-t-types.2Fpolonius/topic/Borrow-checking.20irreducible.20control-flow.3F), so no specific changes are needed.
 
 # Drawbacks
 [drawbacks]: #drawbacks
 
 ## irreducable control flow
 
-The `const continue` construct introduces a way of expressing [irreducable control flow](https://en.wikipedia.org/wiki/Control-flow_graph#Reducibility).
-
-TODO
+The `const continue` construct introduces a way of expressing [irreducable control flow](https://en.wikipedia.org/wiki/Control-flow_graph#Reducibility) in the rust surface language. As far as we know, there are no blockers (e.g. [borrow checking should be able to handle it](https://rust-lang.zulipchat.com/#narrow/channel/186049-t-types.2Fpolonius/topic/Borrow-checking.20irreducible.20control-flow.3F), but currently it is not specified that HIR to MIR desugaring can introduce irreducable control flow (this has been discussed in [#114047](https://github.com/rust-lang/rust/issues/114047).
 
 # Rationale and alternatives
 [rationale-and-alternatives]: #rationale-and-alternatives
@@ -953,23 +996,23 @@ register count;
 
 This fall-through behavior is often considered unintuitive, to the point that in many C code bases, such fall-throughs are explicitly labeled with a comment to call attention to the fact that the fall-through is deliberate. But this feature is a part of C for a reason: the fall-through is an unconditional jump, which is often essential for good performance.
 
-The labeled match proposal has two major advantages over fallthrough:
+The `loop match` proposal has two major advantages over fallthrough:
 
 - there is no need to list branches in a particular order
 - more than one next state can be reached with a direct jump
 
-It turns out that labeled match is fairly expressive, and can in fact express Duff's device:
+It turns out that `loop match` is fairly expressive, and can in fact express Duff's device:
 
 ```rust
 // originally written by Ralf Jung on zullip
 // assumes count > 0
 // `one()` performs a one-byte write and increments the counters
 let mut n = count.div_ceil(4);
-'top: match count % 4 {
-  0 => { one(); continue 'top 3 }
-  3 => { one(); continue 'top 2 }
-  2 => { one(); continue 'top 1 }
-  1 => { one(); n -= 1; if n > 0 { continue 'top count % 4; } }
+loop match count % 4 
+  0 => { one(); const continue 3 }
+  3 => { one(); const continue 2 }
+  2 => { one(); const continue 1 }
+  1 => { one(); n -= 1; if n > 0 { continue count % 4; } }
   _ => unreachable(),
 }
 ```
@@ -1024,7 +1067,7 @@ Nested labeled blocks do not spark joy.
 
 Macros can be used to tame the syntactic complexity to some extent, but that just introduces custom syntax to learn for something as fundamental to a low level programming language as a state machine. Furthermore, editor experience within macros is still not as good as for first-class language constructs.
 
-A second limitation is that only forward jumps (from an earlier to a later branch) are possible. To go back to an earlier branch, a loop and unpredictable match are still required. Thus, labeled match wins in brevity, expressivity and code generation quality.
+A second limitation is that only forward jumps (from an earlier to a later branch) are possible. To go back to an earlier branch, a loop and unpredictable match are still required. Thus, `loop match` wins in brevity, expressivity and code generation quality.
 
 ## guaranteed tail calls
 
@@ -1040,11 +1083,11 @@ This [zig issue](https://github.com/ziglang/zig/issues/8220) gives three good re
 - logic must be organized into functions, this has potential performance implications, but also stylistic ones.
 - debugging of logic structured with tail calls is much more difficult than code that stays within a single stack frame
 
-Tail calls are a useful tool, and rust should have them, but there are still use cases for labeled match.
+Tail calls are a useful tool, and rust should have them, but there are still use cases for `loop match`. 
 
 ### zlib-rs usage report
 
-We benchmarked an implementation using tail calls versus "loop + match" and our PoC labeled match implementation. The results are [here](https://gist.github.com/folkertdev/977183fb706b7693863bd7f358578292). We see significant (~15%) speedups of labeled match over tail calls in some benchmarks.
+We benchmarked an implementation using tail calls versus "loop + match" and our PoC `loop match` implementation. The results are [here](https://gist.github.com/folkertdev/977183fb706b7693863bd7f358578292). We see significant (~15%) speedups of `loop match` over tail calls in some benchmarks.
 
 ```
 Benchmark 3 (80 runs): /tmp/labeled-match-len rs-chunked 4 silesia-small.tar.gz
@@ -1055,7 +1098,7 @@ Benchmark 3 (80 runs): /tmp/labeled-match-len rs-chunked 4 silesia-small.tar.gz
   instructions        686M  ±  267       686M  …  686M           0 ( 0%)        ⚡- 24.9% ±  0.0%
 ```
 
-In the labeled match version we load many values to the stack explicitly, and keep them there for the full duration of the function. The tail call approach instead needs to load values from the state repeatedly. In theory LLVM might be able to remove these redundant loads, but it looks like it can't today. Labeled match is easier to optimize by both the programmer and the compiler in this case.
+In the `loop match` version we load many values to the stack explicitly, and keep them there for the full duration of the function. The tail call approach instead needs to load values from the state repeatedly. In theory LLVM might be able to remove these redundant loads, but it looks like it can't today. A `loop match` is easier to optimize by both the programmer and the compiler in this case.
 
 ## Join points
 
@@ -1069,7 +1112,7 @@ But, rust does not have problem (heap-allocated closure) or the constraint (nice
 
 The feature proposed in https://internals.rust-lang.org/t/pre-rfc-safe-goto-with-value/14470/51 touches on a lot of the same problems as this RFC.
 
-The advantage of labeled match is that it is not as syntactically experimental. No new constructs or keywords are really needed, we "just" allow labels before match, and add an operand to `continue` just like `break` already has. Labeled match fits into current rust nicely, while being just as expressive.
+The advantage of `loop match` is that it makes a connection between control flow and data flow. In particular with label-based proposals, it is laborious to store a state and later resume in that state.
 
 ## Computed goto
 
@@ -1120,7 +1163,7 @@ There are two reasons one might use a computed goto
 - get better code generation than the standard "loop + match"
 - indexing into an array of future states is more natural than a match
 
-However, labeled match promises even better code generation than the jump table that computed goto produces in cases where targets are compile-time known, and has roughly similar ergonomics, e.g.
+However, `loop match` promises even better code generation than the jump table that computed goto produces in cases where targets are compile-time known, and has roughly similar ergonomics, e.g.
 
 ```rust
 macro_rules! dispatch() {
@@ -1131,40 +1174,40 @@ macro_rules! dispatch() {
     }
 }
 
-'top: match dispatch!() {
+loop match dispatch!() {
     DO_HALT => break 'top val,
     DO_INC => {
         val += 1;
-        continue 'top dispatch!();
+        continue dispatch!();
     DO_DEC => {
         val -= 1;
-        continue 'top dispatch!();
+        continue dispatch!();
     }
     DO_MUL2 => {
         val *= 2;
-        continue 'top dispatch!();
+        continue dispatch!();
     }
     DO_DIV2 => {
         val /= 2;
-        continue 'top dispatch!();
+        continue dispatch!();
     }
     DO_ADD7 => {
         val += 7;
-        continue 'top dispatch!();
+        continue dispatch!();
     }
     DO_NEG => {
         val = -val;
-        continue 'top dispatch!();
+        continue dispatch!();
     }
     _ => unreachable!(), // or unreachable_unchecked()
 }
 ```
 
-In the current PoC implementation each `continue` will duplicate the match, leading to the branch prediction behavior that makes computed goto attractive. However, it is not currently clear that this desugaring will be kept when the next branch is not compile-time known.
+In the current PoC implementation each `continue` will duplicate the match, leading to the branch prediction behavior that makes computed goto attractive. However, it is not currently clear that this desugaring will be kept for non-const `continue <operand>`.
 
 ## improve MIR optimizations
 
-In theory, more sophisticated analysis of the MIR should be able to optimize the "loop + match" pattern into a collection of unconditional jumps. We've seen that it's not capable of performing this optimization today, but if it could, then from a performance perspective maybe labeled match would not be needed.
+In theory, more sophisticated analysis of the MIR should be able to optimize the "loop + match" pattern into a collection of unconditional jumps. We've seen that it's not capable of performing this optimization today, but if it could, then from a performance perspective maybe `loop match` would not be needed.
 
 While improvements to rust's MIR passes (or even a whole new IR that is better suited to optimization) are certainly possible, limitations are:
 
@@ -1175,16 +1218,16 @@ While improvements to rust's MIR passes (or even a whole new IR that is better s
 
 In contrast
 
-- labeled match is a desugaring no more complex than labeled loops and blocks
-- the transformation is syntactic, and therefore nicely bounded
+- loop match is a desugaring no more complex than labeled loops and blocks
+- the transformation is syntax-driven, and therefore nicely bounded
 - programmers can write their code in such a way that they can be confident the desugaring to a `goto` kicks in
 - the (expert) programmer definitely wants the desugaring into a `goto`
 
-So, labeled match is a solid way to make progress on better codegen. Improved optimizations on MIR are also very welcome, but never entirely remove the need for labeled match from a programmer's perspective.
+So, `loop match` is a solid way to make progress on better codegen. Improved optimizations on MIR are also very welcome, but never entirely remove the need for `loop match` from a programmer's perspective.
 
 ## recognize "loop + match" and optimize
 
-In theory it is possible to internally recognize and rewrite a "loop + match" expression into a labeled match. With this approach, no changes to language syntax are needed.
+In theory it is possible to internally recognize and rewrite a "loop + match" expression into a `loop match`. With this approach, no changes to language syntax are needed.
 
 A fundamental problem with this approach is a change in drop order:
 
@@ -1202,19 +1245,19 @@ let mut state = 0;
     }
 }
 
-// versus if you rewrite to labeled match
+// versus if you rewrite to `loop match` 
 
-'label: match 0 {
+loop match 0 {
     0 => {
         let x = vec![1,2,3];
         // drop of `x` happens before the state update
-        continue 'label 1;
+        continue 1;
     }
     _ => ...
 }
 ```
 
-Beyond that, the analysis for recognizing "loop + match" will likely be complex and fragile. Part of the appeal of labeled match is that the desugaring rules are simple and deterministic. Using a labeled match signals that something subtle is going on: for readers and future reviewers it is clear that the labeled match desugaring is desired and potentially crucial for the code to perform well.
+Beyond that, the analysis for recognizing "loop + match" will likely be complex and fragile. Part of the appeal of `loop match` is that the desugaring rules are simple and deterministic. Using a `loop match` is intentional, and signals that something subtle is going on: for readers and future reviewers it is clear that the `loop match` desugaring is desired and potentially crucial for the code to perform well.
 
 ## introduce just `continue <operand>`
 
@@ -1264,12 +1307,12 @@ Two problems were identified with this syntax
 
 The `loop match` syntax is easily searchable, and gives a good intuition for what the construct does (it loops and matches). A downside of this syntax is that it is both a loop and a match in one, so error messages have to be revised to be accurate (e.g. how to report that a `loop match` is non-exhaustive).
 
-The `const continue` variant of `continue <operand>` was introduced later, because:
+The `loop const match` and `const continue` variants were introduced later, because:
 
-- it demands that the jump target is known at compile time
-- it guarantees the desugaring to a MIR `goto`: this has borrow checker implications
+- they demand that the jump target is known at compile time
+- they guarantee the desugaring to a MIR `goto`: this has borrow checker implications
 
-So, `const continue` provides a specific place to document the conditions and behavior, and makes it possible to use `loop match` for ergonomics reasons even if the next state is not statically known.
+The usage of `const` provides a specific place to document the conditions and behavior, and makes it possible to use `loop match` for ergonomics reasons even if the next state is not statically known.
 
 The original proposal was `static continue`, which is fine but `const continue` gives a better intuition for what the operand should be.
 
@@ -1280,6 +1323,7 @@ In summary, `loop match`:
 - is a straightforward combination of `loop` and `match`. In its basic form it is just syntax sugar, and should not present issues for beginners. The more advanced `const continue` is a fairly specific tool, that
 - does not introduce arbitrary control flow (like general `goto`) or surprising implicit control flow (like `switch` fallthrough in C and descendants). The mechanism fits nicely into how rust works today.
 - is not blocked on LLVM, and can be implemented entirely in rustc, providing benefits to all code generation backends. The implementation and maintenance effort is small, because infrastructure that is already in place for labeled loops and blocks is reused.
+- accepts more valid programs, by providing more accurate CFG information to the backend.
 
 The codegen characteristics provided by `const continue` are essential in real-world programs, like [`zlib-rs`](https://github.com/memorysafety/zlib-rs). Improvements to MIR optimizations are welcome, but unlikely to reliably give the desired codegen. The inability to generate efficient code actively limits the adoption of rust in domains where performance is key. Without a feature like this, it is effectively impossible to beat C in certain important cases.
 
@@ -1297,9 +1341,9 @@ The idea was first introduced in [this issue](https://github.com/ziglang/zig/iss
 
 **What parts of the design do you expect to resolve through the RFC process before this gets merged?**
 
-- introduction of `loop match <scrutinee> { ... }`, `continue <operand>` and `const continue <operand>` syntax
+- introduction of `loop const? match <scrutinee> { ... }`, and `const? continue <operand>` syntax 
 - when a `const continue` operand is accepted (i.e. under what conditions we can/want to guarantee a MIR `goto` will be produced)
-- the semantics of `const continue`: this construct has borrow checker implications and introduces irreducable control flow in the surface language
+- the semantics of `loop const match` and `const continue`: these constructs have borrow checker implications and introduce irreducable control flow in the surface language
 
 The RFC text provides background on why this feature is needed for improved code generation, but from the language perspective, only the above three elements are required.
 
@@ -1315,6 +1359,29 @@ None so far
 
 # Future possibilities
 [future-possibilities]: #future-possibilities
+
+## Relax the constraints on the `loop const match` and `const continue` operands
+
+We currently don't know how to do this exactly, but it seems feasible to accept (some) values where part of the pattern is known, e.g. 
+
+```rust
+loop match None {
+    None => {
+        println!("None");
+        const continue Some(unsafe { not_comptime_known() });
+    }
+    Some(false) => {
+        println!("Some(false)");
+        const continue Some(false);
+    }
+    Some(true) => {
+        println!("Some(true)");
+        break;
+    }
+}
+```
+
+Some extensions are just hard to specify with the vocabulary we currently have (these values are not const, or static promotable), other cases would expose the order in which patterns are evaluated, and so this order would have to be stabilized in order to support them for the const variants of `loop match`.
 
 ## Computed GOTO
 
