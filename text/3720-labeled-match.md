@@ -477,14 +477,15 @@ fn loop_plus_match() -> Option<u8> {
 }
 ```
 
-So far `loop match` is just syntax sugar. Its power lies in the `const continue value` expression, which gives the compiler more information about the control flow of your program.
+So far `loop match` is just syntax sugar. Its power lies in a combination with the `const` keyword, that provides the compiler with more accurate
+information about the control flow of your program.
 
-For example, this program is valid because with `loop match` all paths that makes it to the `false` branch will have initialized the `x` variable:
+For example, this program is valid because with `loop match const` and `const continue` all paths that makes it to the `false` branch will have initialized the `x` variable:
 
 ```rust
 let x: u64;
 
-loop match true {
+loop match const true {
     true => {
         x = 42;
         const continue false;
@@ -518,18 +519,20 @@ loop {
 Reading the code, it is obvious that state moves from states `Foo` to `Bar` to `Baz`: no other path is possible. Specifically, we cannot end up in `State::Bar` twice, and hence the generated "use of moved value" error is not a problem in practice. With `loop match` and `const continue` the compiler now understands the control flow:
 
 ```rust
-loop match State::Foo {
+loop match const State::Foo {
     State::Foo => const continue State::Bar,
     State::Bar => {
         // or any function that moves the value
         drop(owned); // all good now!
-        continue State::Baz;
+        const continue State::Baz;
     }
     State::Baz => break,
 }
 ```
 
-This more accurate understanding of control flow has advantages for the borrow checker, but also for other downstream compiler passes. To use a `const continue value` expression, it must be clear what branch `value` is going to choose.
+This more accurate understanding of control flow has advantages for the borrow checker, but also for other downstream compiler passes. 
+
+To use a `loop match const <expr>` or `const continue <expr>` expression, the `<expr>` must be [static-promotable](https://github.com/rust-lang/rfcs/pull/1414). 
 
 # Reference-level explanation
 [reference-level-explanation]: #reference-level-explanation
@@ -548,7 +551,8 @@ The changes to the language are:
 
 - we add `loop match` expressions: `loop match scrutinee { ... }`
 - `continue <operand>` expressions can target the `loop match`, replacing `scrutinee` with `<operand>` and proceeding to the correct match branch
-- `const continue <operand>` same as above, but changes MIR lowering and borrow checker behavior.
+
+A `loop match` can be combined with the `const` keyword, which improves MIR lowering and provides more accurate CFG information to the borrow checker and later compiler passes.
 
 ## Edge cases
 
@@ -656,6 +660,23 @@ loop match read_next_byte() {
 }
 ```
 
+### `loop match const` and `const continue` can be freely mixed 
+
+We can have a `loop match const` with non-const continues:
+
+```rust
+loop match const State::Start {
+    State::Start => continue next_state(),
+    State::S2 => break,
+    State::S3 => const continue State::S2,
+    State::Finished => break,
+}
+``` 
+
+And likewise `const continue` is valid in a non-const `loop match`. In all cases, we only get the improved MIR lowering for the transitions that are explicitly annotated as `const`.
+
+It might make sense to have clippy lints to enforce that a certain `loop match` should only have `const` transitions.
+
 ## Restrictions on the `const continue` operand
 
 Intuitively, the target of a `const continue` must be known at compile time. In this section we make this more precise.
@@ -691,7 +712,31 @@ loop match None {
 }
 ```
 
-Intuitively, a `goto` could be inserted to the `Some(_)` pattern (which does not exist in the surface language, but its equivalent is inserted by pattern match desugaring). However, dealing with partial patterns leaks information about the order in which patterns are evaluated. There's an ongoing discussion about whether rust can/should commit to a particular order or not. Expanding the category of expressions that is accepted is therefore left as future work.
+Intuitively, a `goto` could be inserted to the `Some(_)` pattern (which does not exist in the surface language, but its equivalent is inserted by pattern match desugaring). However, dealing with partial patterns leaks information about the order in which patterns are evaluated. There's an ongoing discussion about whether rust can/should commit to a particular order or not. 
+
+Unfortunately, this snippet is also rejected even though here the desired behavior is clear. We just don't currently have an accurate way of describing that this snippet is valid and the one above is not, so we conservatively reject both.
+
+```rust
+loop match None {
+    None => {
+        println!("None");
+        const continue Some(unsafe { not_comptime_known() });
+    }
+    Some(b) => match b { 
+        false => {
+            println!("Some(false)");
+            const continue Some(false);
+        }
+        true => {
+            println!("Some(true)");
+            break;
+        }
+    }
+}
+```
+
+
+Expanding the category of expressions that is accepted is therefore left as future work.
 
 ## Proof of Concept
 
