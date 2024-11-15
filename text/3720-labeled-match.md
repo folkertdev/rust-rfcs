@@ -94,6 +94,8 @@ Today, we simply cannot achieve the same codegen as C implementations. This limi
 
 State machines require flexible control flow. However, the unstructured control flow of C is in many ways too flexible: it is hard for programmers to follow and for tools to reason about and give good errors for. Ideally, there is a middle ground between code that is easy to understand (by human and machine), interacts well with other rust features, and is flexible enough to efficiently express state machine logic.
 
+Additonally rust is a lot more strict than C: values must be initialized before use, and cannot be used after they have been dropped or moved. The analysis to determine whether a value can be used is conservative: there are valid programs (that would not exhibit incorrect behavior at runtime) that are nonetheless not accepted by the rust compiler. Accepting more valid programs while still rejecting all incorrect programs is an improvement.
+
 Today there is no good way to translate C code that uses implicit fallthroughs or similar control flow to rust while preserving both the ergonomics (in particular, a consistent level of indentation) and the performance (due to LLVM using jump tables instead of an unconditional jump, see the next section). If we wanted to translate this C code to Rust:
 
 ```c
@@ -557,8 +559,71 @@ The changes to the language are:
 
 - we add `loop match` expressions: `loop match scrutinee { ... }`
 - `continue <operand>` expressions can target the `loop match`, replacing `scrutinee` with `<operand>` and proceeding to the correct match branch
+- state transitions can be annotated with the `const` keyword (i.e. `loop const match` and `const continue`), which provides more accurate CFG information to the backend:
+    - such transitions must occur on static-promotable values (see below)
+    - such transitions are lowered from HIR to MIR as a `goto` to the right `match` branch, and can express irreducable control flow
 
-A `loop match` can be combined with the `const` keyword, which improves MIR lowering and provides more accurate CFG information to the borrow checker and later compiler passes.
+## Restrictions on the `loop const match` and `const continue` operand
+
+Intuitively, the target of a `const continue` must be known at compile time. In this section we make this more precise.
+
+This RFC limits itself to values that are eligible for "static promotion" as introduced in [RFC 1414](https://github.com/rust-lang/rfcs/blob/master/text/1414-rvalue_static_promotion.md). These are expressions that would compile in the following snippet:
+
+```rust
+let x: &'statix _ = &EXPR;
+```
+
+For these values, it can always be statically known exactly which branch the value ends up in. This limited support is sufficient for translating C state machines that use `goto` and labels.
+
+But compared to the full power of rust patterns, this limitation is unfortunate. Specifically, in this RFC, the following will be rejected:
+
+```rust
+extern "Rust" {
+    fn not_comptime_known() -> bool;
+}
+
+loop match None {
+    None => {
+        println!("None");
+        const continue Some(unsafe { not_comptime_known() });
+    }
+    Some(false) => {
+        println!("Some(false)");
+        const continue Some(false);
+    }
+    Some(true) => {
+        println!("Some(true)");
+        break;
+    }
+}
+```
+
+Intuitively, a `goto` could be inserted to the `Some(_)` pattern (which does not exist in the surface language, but its equivalent is inserted by pattern match desugaring). However, dealing with partial patterns leaks information about the order in which patterns are evaluated. There's an ongoing discussion about whether rust can/should commit to a particular order or not. 
+
+Unfortunately, the following snippet is also rejected even though here the desired behavior is clear. We just don't currently have an accurate way of describing that this snippet is valid and the one above is not, so we conservatively reject both.
+
+```rust
+loop match None {
+    None => {
+        println!("None");
+        const continue Some(unsafe { not_comptime_known() });
+    }
+    Some(b) => match b { 
+        false => {
+            println!("Some(false)");
+            const continue Some(false);
+        }
+        true => {
+            println!("Some(true)");
+            break;
+        }
+    }
+}
+```
+
+
+Expanding the set of expressions that is accepted is therefore left as future work.
+
 
 ## Edge cases
 
@@ -686,67 +751,6 @@ loop const match State::Start {
 And likewise `const continue` is valid in a non-const `loop match`. In all cases, we only get the improved MIR lowering for the transitions that are explicitly annotated as `const`.
 
 It might make sense to have clippy lints to enforce that a certain `loop match` should only have `const` transitions.
-
-## Restrictions on the `const continue` operand
-
-Intuitively, the target of a `const continue` must be known at compile time. In this section we make this more precise.
-
-This RFC limits itself to values that are eligible for "static promotion" as introduced in [RFC 1414](https://github.com/rust-lang/rfcs/blob/master/text/1414-rvalue_static_promotion.md). These are expressions that would compile in the following snippet:
-
-```rust
-let x: &'statix _ = &EXPR;
-```
-
-For these values, it can always be statically known exactly which branch the value ends up in. This limited support is sufficient for translating C state machines that use `goto` and labels.
-
-But compared to the full power of rust patterns, this limitation is unfortunate. Specifically, in this RFC, the following will be rejected:
-
-```rust
-extern "Rust" {
-    fn not_comptime_known() -> bool;
-}
-
-loop match None {
-    None => {
-        println!("None");
-        const continue Some(unsafe { not_comptime_known() });
-    }
-    Some(false) => {
-        println!("Some(false)");
-        const continue Some(false);
-    }
-    Some(true) => {
-        println!("Some(true)");
-        break;
-    }
-}
-```
-
-Intuitively, a `goto` could be inserted to the `Some(_)` pattern (which does not exist in the surface language, but its equivalent is inserted by pattern match desugaring). However, dealing with partial patterns leaks information about the order in which patterns are evaluated. There's an ongoing discussion about whether rust can/should commit to a particular order or not. 
-
-Unfortunately, the following snippet is also rejected even though here the desired behavior is clear. We just don't currently have an accurate way of describing that this snippet is valid and the one above is not, so we conservatively reject both.
-
-```rust
-loop match None {
-    None => {
-        println!("None");
-        const continue Some(unsafe { not_comptime_known() });
-    }
-    Some(b) => match b { 
-        false => {
-            println!("Some(false)");
-            const continue Some(false);
-        }
-        true => {
-            println!("Some(true)");
-            break;
-        }
-    }
-}
-```
-
-
-Expanding the set of expressions that is accepted is therefore left as future work.
 
 ## Proof of Concept
 
@@ -969,7 +973,9 @@ The borrow checker already operates on basic blocks, and [can handle irreducable
 
 ## irreducable control flow
 
-The `const continue` construct introduces a way of expressing [irreducable control flow](https://en.wikipedia.org/wiki/Control-flow_graph#Reducibility) in the rust surface language. As far as we know, there are no blockers (e.g. [borrow checking should be able to handle it](https://rust-lang.zulipchat.com/#narrow/channel/186049-t-types.2Fpolonius/topic/Borrow-checking.20irreducible.20control-flow.3F), but currently it is not specified that HIR to MIR desugaring can introduce irreducable control flow (this has been discussed in [#114047](https://github.com/rust-lang/rust/issues/114047).
+The `const continue` construct introduces a way of expressing [irreducable control flow](https://en.wikipedia.org/wiki/Control-flow_graph#Reducibility) in the rust surface language. As far as we know, there are no blockers (e.g. [borrow checking should be able to handle it](https://rust-lang.zulipchat.com/#narrow/channel/186049-t-types.2Fpolonius/topic/Borrow-checking.20irreducible.20control-flow.3F), but currently it is not specified that HIR to MIR desugaring can introduce irreducable control flow (this has been discussed in [#114047](https://github.com/rust-lang/rust/issues/114047)).
+
+So while there are no blockers for this particular RFC, once you have irreducable control flow in the language there is no way back.
 
 # Rationale and alternatives
 [rationale-and-alternatives]: #rationale-and-alternatives
@@ -1014,7 +1020,7 @@ It turns out that `loop match` is fairly expressive, and can in fact express Duf
 // assumes count > 0
 // `one()` performs a one-byte write and increments the counters
 let mut n = count.div_ceil(4);
-loop match count % 4 
+loop match count % 4 {
   0 => { one(); const continue 3 }
   3 => { one(); const continue 2 }
   2 => { one(); const continue 1 }
@@ -1112,7 +1118,7 @@ In functional languages, where closures are typically heap-allocated, non-toplev
 
 Join points are implemented in at least Haskell, Lean, Koka and Roc. None of these languages have explicit syntax for a user to write a join point: programmers know the rules the compiler uses to promote a binding to a join point, and write their code so that the optimization kicks in. This is similar to how these and other languages guarantee tail-call elimination if the code is structured a certain way.
 
-But, rust does not have problem (heap-allocated closure) or the constraint (nice algebraic rewriting properties) of the languages where this construct is used. Closures in rust are already cheap to create and stored on the stack. Mutation and constructs like loops with breaks make applying rewrite rules of the style used in functional compilers virtually impossible already.
+But, rust does not have the problem (heap-allocated closure) or the constraint (nice algebraic rewriting properties) of the languages where this construct is used. Closures in rust are already cheap to create and stored on the stack. Mutation and constructs like loops with breaks make applying rewrite rules of the style used in functional compilers virtually impossible already.
 
 ## Safe GOTO
 
@@ -1368,7 +1374,7 @@ None so far
 
 ## Relax the constraints on the `loop const match` and `const continue` operands
 
-We currently don't know how to do this exactly, but it seems feasible to accept (some) values where part of the pattern is known, e.g. 
+We currently don't know how to do this exactly, but it seems feasible to accept (some) values where only part of the pattern is known, e.g. 
 
 ```rust
 loop match None {
@@ -1387,11 +1393,13 @@ loop match None {
 }
 ```
 
-Some extensions are just hard to specify with the vocabulary we currently have (these values are not const, or static promotable), other cases would expose the order in which patterns are evaluated, and so this order would have to be stabilized in order to support them for the const variants of `loop match`.
+Some extensions are just hard to specify with the vocabulary we currently have (these partially-known values are not const, or static promotable), other cases would expose the order in which patterns are evaluated, and so this order would have to be stabilized in order to support them for the const variants of `loop match`.
 
 ## Computed GOTO
 
 Depending on how the experiments around the exact desugaring strategy work out, we might be able to lower a `continue value` on an unknown value into a jump table. The current PoC has this behavior, but further experimentation is needed to establish if the codegen is actually good, and how the downsides (e.g. larger binary size) can be managed.
+
+This [recent thread](https://internals.rust-lang.org/t/idea-for-safe-computed-goto-using-enums/21787)  has some further ideas.
 
 # Thanks
 
