@@ -13,6 +13,8 @@ This RFC adds `loop match`:
 
 A `loop match` can be combined with the `const` keyword, which improves MIR lowering and provides more accurate CFG information to the borrow checker and later compiler passes.
 
+### Basic example
+
 A `loop match` is similar to a `match` inside of a `loop`, with a mutable variable being updated to move to the next state. For instance, these two functions are semantically equivalent:
 
 ```rust
@@ -37,6 +39,8 @@ fn loop_plus_match() -> Option<u8> {
     }
 }
 ```
+
+### Interesting example
 
 The real power of `loop match` lies in giving the compiler more accurate information about the control flow of a program. Consider
 
@@ -424,7 +428,7 @@ looper:
         .long   .LBB0_10-.LJTI0_0
 ```
 
-LLVM has generated a jump table, and all state transitions go via this jump table, even the first initial one where LLVM definitely should know that we're in `State::S1`:
+LLVM has generated a jump table, and all state transitions go via this jump table. For the branches, this is done with the `jne .LBB0_1` jump, but even the initial pattern match goes via the jump table where LLVM definitely should know that we're in `State::S1`:
 
 ```asm
 .LBB0_1:
@@ -434,7 +438,9 @@ LLVM has generated a jump table, and all state transitions go via this jump tabl
         jmp     rdi
 ```
 
-As a programmer, we have no control over this process. Adding one extra state transition to your program, or making some other small change, can thus cause a major performance regression.
+This code generation is bad! This example should generate direct jumps to the next state, but even if it didn't, it should duplicate the jump table lookup logic (the `jmp rdi` specifically) to each `match` branch, so that the branch predictor can keep track of each `match` branch individually where it is most likely to jump to next.
+
+As a programmer, we have no control over the code generation. Adding one extra state transition to your program, or making some other small change, can thus cause a major performance regression.
 
 # Guide-level explanation
 [guide-level-explanation]: #guide-level-explanation
