@@ -13,7 +13,7 @@ This RFC adds `loop match`:
 
 The state transitions (going from one branch of the match to another) can be annotated with the `const` keyword, providing more accurate CFG information to the backend. That means:
 
-- more valid programs are accepted by the borrow checker
+- more valid programs are accepted, increasing expressivity
 - the backend can generate better code, leading to significant speedups
 
 ### Basic example
@@ -504,7 +504,7 @@ loop const match true {
 }
 ```
 
-The more precise control flow information is also used by the borrow checker, so that more valid programs are accepted. Consider this program that errors, but is valid in practice:
+The more precise control flow information is also used by the borrow checker, so that more valid programs are accepted. This program that uses a standard `loop` and `match` and runs into a "use of moved value" error:
 
 ```rust
 enum State { Foo, Bar, Baz, }
@@ -524,7 +524,7 @@ loop {
 }
 ```
 
-Reading the code, it is obvious that state moves from states `Foo` to `Bar` to `Baz`: no other path is possible. Specifically, we cannot end up in `State::Bar` twice, and hence the generated "use of moved value" error is not a problem in practice. This program is valid in practice, but rejected by the rust compiler.
+Reading the code, it is obvious that state moves from states `Foo` to `Bar` to `Baz`: no other path is possible. Specifically, we cannot end up in `State::Bar` twice, and hence the generated "use of moved value" error is not a problem in practice. This program is valid, but rejected by the rust compiler.
 
 By using `loop match` and annotating the state transitions with `const`, the compiler now understands the control flow:
 
@@ -561,9 +561,12 @@ The changes to the language are:
 
 - we add `loop match` expressions: `loop match scrutinee { ... }`
 - `continue <operand>` expressions can target the `loop match`, replacing `scrutinee` with `<operand>` and proceeding to the correct match branch
-- state transitions can be annotated with the `const` keyword (i.e. `loop const match` and `const continue`), which provides more accurate CFG information to the backend:
-    - such transitions must occur on static-promotable values (see below)
-    - such transitions are lowered from HIR to MIR as a `goto` to the right `match` branch, and can express irreducible control flow
+- state transitions can be annotated with the `const` keyword: `loop const match` and `const continue`
+
+The const-annotated state transitions provide more accurate CFG information to the backend:
+
+- such transitions must occur on static-promotable values (see below)
+- such transitions are lowered from HIR to MIR as a `goto` to the right `match` branch, and can hence express irreducible control flow
 
 ## Restrictions on the `loop const match` and `const continue` operand
 
@@ -575,17 +578,15 @@ let x: &'statix _ = &<expr>;
 
 For these values, it can always be statically known exactly which branch the value ends up in. This limited support is sufficient for translating C state machines that use `goto` and labels.
 
-But compared to the full power of rust patterns, this limitation is unfortunate. Specifically, in this RFC, the `const continue` in the `None` branch here will be rejected:
+Of cousre, compared to the full power of rust patterns, this limitation is unfortunate. Specifically, in this RFC, the `const continue` in the `None` branch here will be rejected:
 
 ```rust
-extern "Rust" {
-    fn not_comptime_known() -> bool;
-}
+use core::hint::black_box;
 
 loop match None {
     None => {
         println!("None");
-        const continue Some(unsafe { not_comptime_known() });
+        const continue Some(black_box(true));
     }
     Some(false) => {
         println!("Some(false)");
@@ -606,7 +607,7 @@ Unfortunately, the following snippet is also rejected even though here the desir
 loop match None {
     None => {
         println!("None");
-        const continue Some(unsafe { not_comptime_known() });
+        const continue Some(core::hint::black_box(true));
     }
     Some(b) => match b {
         false => {
@@ -698,13 +699,9 @@ The rules are described [here](#restrictions-on-the-const-continue-operand).
 If the value is not of the right form, it will be rejected:
 
 ```rust
-extern "Rust"  [
-    fn not_comptime_known() -> u8;
-}
-
 loop match 1u8 {
     0 => break,
-    _ => const continue unsafe { not_comptime_known() },
+    _ => const continue core::hint::black_box(42),
 }
 ```
 
@@ -712,13 +709,13 @@ loop match 1u8 {
 error[E0000]: `continue` with value target unknown at compile time
  --> src/main.rs:3:9
   |
-4 |         const continue not_comptime_known(),
-  |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ the target of this `continue` is unknown at compile time
+4 |         const continue core::hint::black_box(42),
+  |                        ^^^^^^^^^^^^^^^^^^^^^^^^^ this target of a `continue` is not known at compile time
   |
 help: use a non-const `continue` with value instead
   |
-4 |         continue not_comptime_known(),
-  |         ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+4 |         continue core::hint::black_box(42),
+  |         ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 ```
 
 ### plain `continue` in a `loop match`
@@ -943,7 +940,7 @@ will desugar into (roughly)
     }
 ```
 
-because all branches either diverge or perform a direct jump to a next state, the match is completely elided in this case.
+Because the control flow is known statically, the match disappears in this case.
 
 ## Implications for borrow checking
 
@@ -1227,7 +1224,7 @@ While improvements to rust's MIR passes (or even a whole new IR that is better s
 
 In contrast
 
-- loop match is a desugaring no more complex than labeled loops and blocks
+- loop match has a straightforward desugaring
 - the transformation is syntax-driven, and therefore nicely bounded
 - programmers can write their code in such a way that they can be confident the desugaring to a `goto` kicks in
 - the (expert) programmer definitely wants the desugaring into a `goto`
