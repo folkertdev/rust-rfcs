@@ -8,31 +8,124 @@
 
 Support the `cmse-nonsecure-entry` and `cmse-nonsecure-call` calling conventions.
 
-
 # Motivation
 [motivation]: #motivation
 
 Rust and Trustzone form an excellent pairing for developing embedded projects that are secure and robust.
 
-
 # Guide-level explanation
 [guide-level-explanation]: #guide-level-explanation
 
-The cmse calling conventions are part of the *Cortex-M Security Extension* that are available on thumbv8 systems. They are used together with Trustzone (hardware isolation) to create more secure embedded applications.
+The cmse calling conventions are part of the *Cortex-M Security Extension* that are available on thumbv8 systems. They are used together with Trustzone (hardware isolation) to create more secure embedded applications.  Arm defines the toolchain requirements in  [ARMv8-M Security Extensions: Requirements on Development Tools - Engineering Specification](https://developer.arm.com/documentation/ecm0359818/latest/), but of course this specification needs to be interpreted in a rust context.
 
-The main idea of Trustzone  is to split an embedded application into two executables. The secure executable has access to secrets (e.g. encryption keys), and must be careful not to leak those secrets. The non-secure executable cannot access these secrets, and hence a whole class of security issues is simply impossible in the non-secure app.
+The main idea of Trustzone  is to split an embedded application into two executables. The secure executable has access to secrets (e.g. encryption keys), and must be careful not to leak those secrets. The non-secure executable cannot access these secrets or any memory that is marked as secure: the system will hardfault if it tries to dereference a pointer to memory that it does not have access to. In this way a whole class of security issues is simply impossible in the non-secure app.
 
 The cmse calling conventions facilitate interactions between the secure and non-secure executables. To ensure that secrets do not leak, these calling conventions impose some custom restrictions on top of the system's standard AAPCS calling convention.
 
-The `cmse-nonsecure-entry` calling convention is used in the secure executable to define entry points that the non-secure executable can call. The use of this calling convention hooks into the tooling (LLVM and the linker) to  generate an import library (an object file with only declarations, not actual instructions).
+The `cmse-nonsecure-entry` calling convention is used in the secure executable to define entry points that the non-secure executable can call. The use of this calling convention hooks into the tooling (LLVM and the linker) to  generate a shim that switches the security mode, and an import library (an object file with only declarations, not actual instructions) that can be linked into the non-secure executable.
 
 The `cmse-nonsecure-call` calling convention is used in the other direction, when the secure executable wants to call into the non-secure executable. This calling convention can only occur on function pointers, not on definitions or extern blocks. The secure executable can acquire a non-secure function pointer via shared memory or a non-secure callback can be passed to an entry function.
 
-Both calling conventions are based on the platform's C calling convention, but will not use the stack to pass arguments or the return value. In practice that means that the arguments must fit in the 4 available argument registers, and the return value must fit in a single 32-bit register, or be (a transparently wrapped) 64-bit integer or float. The compiler checks that the signature is valid.
+Both calling conventions are based on the platform's C calling convention, but will not use the stack to pass arguments or the return value. In practice that means that the arguments must fit in the 4 available argument registers, and the return value must fit in a single 32-bit register, or be abi-compatible with a 64-bit integer or float. The compiler checks that the signature is valid.
 # Reference-level explanation
 [reference-level-explanation]: #reference-level-explanation
+## ABI Details
 
-## The `extern "cmse-nonsecure-entry`" CC
+The `cmse-nonsecure-call` and `cmse-nonsecure-entry` ABIs are only accepted on `thumbv8m` targets. On all other targets their use emits an invalid ABI error.
+
+The foundation of the cmse ABIs is the platform's standard AAPCS calling convention. On `thumbv8m` targets `extern "aapcs"` is the default C ABI and equivalent to `extern "C"`.
+
+The `cmse-nonsecure-call` ABI can only be used on function pointers. Using it in for a function definition or extern block emits an error. It is sound to cast such a function to `extern "aapcs"`, but calling the function will cause a HardFault. Casting an `extern "aapcs"` function pointer to a `cmse-nonsecure-call` is valid, but will cause a HardFault if the function's definition is not in non-secure memory.
+
+The `cmse-nonsecure-entry` ABI is allowed on function definitions, extern blocks and function pointers. It is sound and valid (in some cases even encouraged) to cast such a function to `extern "aapcs"`. Calling the function is valid and will behave as expected. Casting an `extern "aapcs"` function pointer to `cmse-nonsecure-entry` is valid, but will not change the security mode.
+
+### Argument passing
+
+The main technical limitation over AAPCS is that the cmse ABIs cannot use the stack for passing function arguments or return values. That leaves only the 4 standard registers to pass arguments, and only supports 1 register worth of return value, unless the return type is ABI-compatible with a 64-bit scalar, which is supported.
+
+```rust
+// Valid
+type T0 = extern "cmse-nonsecure-call" fn(_: i32, _: i32, _: i32, _: i32) -> i32;
+type T1 = extern "cmse-nonsecure-call" fn(_: i64, _: i64) -> i64;
+
+#[repr(transparent)] struct U64(u64);
+type T3 = extern "cmse-nonsecure-call" fn() -> U64;
+
+// Invalid: too many argument registers used
+type T1 = extern "cmse-nonsecure-call" fn(_: i64, _: u8, _: u8, _: u8) -> i64;
+
+// Invalid: return type too large
+type T1 = extern "cmse-nonsecure-call" fn() -> i128;
+
+// Invalid: return type does not fit in one register, and is not abi-compatible with a 64-bit scalar
+#[repr(C)] struct I64(i64);
+type T2 = extern "cmse-nonsecure-call" fn(_: i64, _: i64) -> i64;
+```
+
+An error is emitted when the program contains a signature that violates the calling convention's constraints:
+
+```
+error[E0798]: arguments for `"cmse-nonsecure-entry"` function too large to pass via registers
+  --> $DIR/params-via-stack.rs:15:76
+   |
+LL | pub extern "cmse-nonsecure-entry" fn f1(_: u32, _: u32, _: u32, _: u32, _: u32, _: u32) {}
+   |                                                                            ^^^^^^^^^^^ these arguments don't fit in the available registers
+   |
+   = note: functions with the `"cmse-nonsecure-entry"` ABI must pass all their arguments via the 4 32-bit available argument registers
+```
+
+The error is generated during `hir_ty_lowering`, and therefore even a `cargo check` will emit these errors. Note that LLVM also checks the ABI properties, but it generates poor error messages late in the compilation process.
+
+Because Rust is not C, we impose a couple additional restrictions, based on how these ABIs are (meant to be) used.
+
+### No Generics
+
+No generics are allowed. That includes both standard generics, const generics, and any `impl Trait` in argument or return position. By extension, `async` cannot be used in combination with the cmse ABIs.
+
+```
+error[E0798]: functions with the `"cmse-nonsecure-entry"` ABI cannot contain generics in their type
+  --> $DIR/generics.rs:69:1
+   |
+LL | extern "cmse-nonsecure-entry" fn return_impl_trait(_: impl Copy) -> impl Copy {
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+```
+
+The `cmse-nonsecure-call` calling convention can only be used on function pointers, which already disallows generics. For `cmse-nonsecure-entry`,  it is standard to add a `#[no_mangle]` or similar attribute, which also disallows generics. Explicitly disallowing generics enables the layout calculation that is required for good error messages for signatures that use too many registers.
+### No C-variadics (currently)
+
+Currently both ABIs disallow the use of c-variadics. For `cmse-nonsecure-entry` the toolchain actually does not support c-variadic signatures (likely because of how they interact with veneers, though the specification does not say that explicitly).
+
+- clang rejects c-variadic entry functions: https://godbolt.org/z/MaPjzGcE1
+- but accepts c-variadic nonsecure calls: https://godbolt.org/z/5rdK58ar4
+
+For `cmse-nonsecure-call` we may stabilize c-variadics at some point in the future.
+### Warn on unions and niches
+
+Uninitialized memory, such as space not used by the current enum or union variant, or niches in other values, can contain secret information. A warning is emitted when such values cross the security boundary (move from secure to non-secure).
+
+```
+warning: passing a union across the security boundary may leak information
+  --> $DIR/params-via-stack.rs:43:41
+   |
+LL |     f4: extern "cmse-nonsecure-call" fn(MaybeUninit<u64>),
+   |                                         ^^^^^^^^^^^^^^^^
+   |
+   = note: the bytes not used by the current variant may contain stale secure data
+```
+
+A `cmse-nonsecure-call` function will emit a warning when any of its arguments contains a union or niche, and a `cmse-nonsecure-entry` function warns when it returns a type containing a union or niche.
+
+Even passing a reference emits a warning, because it contains a niche. In practice this is unlikely to come up: the receiving side should validate the address they get anyway, so it would be better to pass a pointer value across the security boundary.
+
+Ultimately guaranteeing the security properties of the system is up to the programmer, but warning on types with potentially uninitialized memory is a helpful signal that the compiler can easily provide.
+
+Clang warns when union values cross the security boundary, see https://godbolt.org/z/vq9xnrnEs.
+
+## Background
+
+Additional background on what these calling conventions do, and how they are meant to be used. This information is not strictly required to understand the RFC, but has informed the design and may explain certain design choices.
+
+### The `extern "cmse-nonsecure-entry`" CC
 
 Functions that use the `cmse-nonsecure-entry` calling convention are called *entry functions*.
 
@@ -43,7 +136,7 @@ An entry function has two ELF symbols labeling it:
 - the standard rust symbol name
 - A special symbol that prefixes the standard name with `__acle_se_`
 
-The presence of the prefixed name is used by the linker to generate a *secure gateway veneer*: a shim that uses the *secure gate* (sg) instruction to switch security modes and then branches to the real definition. The non-secure executable must call this shim, not the real definition.
+The presence of the prefixed name is used by the linker to generate a *secure gateway veneer*: a shim that uses the *secure gate* (`sg`) instruction to switch security modes and then branches to the real definition. The non-secure executable must call this shim, not the real definition.
 
 It is customary for entry functions to use `no_mangle`, `export_name` or similar so that the symbol is not mangled. The use of the `cmse-nonsecure-entry` calling convention will make LLVM emit the additional prefixed symbol. For instance this function:
 
@@ -104,34 +197,6 @@ unsafe extern "cmse-nonsecure-entry" {
 }
 ```
 
-### Technical details
-
-The `cmse-nonsecure-entry` ABI is only accepted on `thumbv8m` targets, on all other targets it generates an invalid ABI error. In terms of passing arguments and return values, it is based on AAPCS, but imposes additional restrictions.
-
-We mirror the LLVM implementation by restricting the number of parameters, their types, and the return type to avoid using the stack for the passing of arguments or the return value. In combination with unused registers getting cleared when switching security modes these restrictions guarantee that secret information cannot accidentally leak.
-
-An error is emitted when the program contains a signature that violates the calling convention's constraints:
-
-```
-error[E0798]: arguments for `"cmse-nonsecure-entry"` function too large to pass via registers
-  --> $DIR/params-via-stack.rs:15:76
-   |
-LL | pub extern "cmse-nonsecure-entry" fn f1(_: u32, _: u32, _: u32, _: u32, _: u32, _: u32) {}
-   |                                                                            ^^^^^^^^^^^ these arguments don't fit in the available registers
-   |
-   = note: functions with the `"cmse-nonsecure-entry"` ABI must pass all their arguments via the 4 32-bit available argument registers
-```
-
-The error is generated during `hir_ty_lowering`, and therefore even a `cargo check` will emit these errors. Note that LLVM also checks the ABI properties, but it generates poor error messages late in the compilation process.
-
-Entry functions cannot be c-variadic (see https://godbolt.org/z/MaPjzGcE1). The official specification does not explicitly mention why. The reason seems to be that the veneer cannot forward the c-variadic arguments correctly.
-
-Entry functions use the special `BXNS` instruction to return to their non-secure caller. To ensure that secure information does not leak, LLVM emits instructions to clear caller-saved registers before returning.
-
-It is sound to cast a `extern "cmse-nonsecure-entry" fn` to a `extern "C" fn`: its argument/return passing rules are a strict subset of the platform's C calling convention. When the system is already in secure mode, the `BXNS` instruction behaves like a standard return.
-
-Because entry functions are meant to be exported, we disallow `async` and more broadly any function returning `impl Trait`.
-
 ###  The `extern "cmse-nonsecure-call`" CC
 
 The `cmse-nonsecure-call` calling convention is used for *non-secure function calls*: function calls that switch from secure to non-secure mode. Because secure and non-secure code are separated into different executables, the only way to perform a non-secure function call is via function pointers. Hence, the `cmse-function-call` calling convention is only allowed on function pointers, not in function definitions or `extern` blocks.
@@ -142,39 +207,6 @@ A *non-secure function pointer*, i.e. a function pointer using the `cmse-nonsecu
 
 The secure executable can get its hands on a non-secure function pointer in two ways: the function address can be an argument to an entry function, or it can be in memory at a statically-known address.
 
-### Technical details
-
-The `cmse-nonsecure-call` ABI is only accepted on `thumbv8m` targets, on all other targets it generates an invalid ABI error. In terms of passing arguments and return values, it is based on AAPCS, but imposes additional restrictions.
-
-Like for `cmse-nonsecure-entry`, we restrict the signature of `cmse-nonsecure-call` so that the stack is not used for argument passing or the return value. Similar errors are generated.
-
-With clang, `__attribute__((cmse_nonsecure_call))` functions can be c-variadic https://godbolt.org/z/5rdK58ar4, but the argument limits still apply. The current rust implementation does not yet allow functions with this calling convention to be c-variadic.
-
-Casting `extern "cmse-nonsecure-call"` to `extern "C"` is not unsound, but calling such a function will trigger a HardFault.
-
-Because `cmse-nonsecure-entry` is only allowed on function pointers, functions with this ABI cannot be `async`, and cannot return any `impl Trait` values.
-
-## Unions & Niches
-
-Uninitialized memory, such as space not used by the current enum or union variant, or niches in other values, can contain secret information. A warning is emitted when such values cross the security boundary (move from secure to non-secure).
-
-```
-warning: passing a union across the security boundary may leak information
-  --> $DIR/params-via-stack.rs:43:41
-   |
-LL |     f4: extern "cmse-nonsecure-call" fn(MaybeUninit<u64>),
-   |                                         ^^^^^^^^^^^^^^^^
-   |
-   = note: the bytes not used by the current variant may contain stale secure data
-```
-
-A `cmse-nonsecure-call` function will emit a warning when any of its arguments contains a union or niche, and a `cmse-nonsecure-entry` function warns when it returns a type containing a union or niche.
-
-Even passing a reference emits a warning, because it contains a niche. In practice this is unlikely to come up: the receiving side should validate the address they get anyway, so it would be better to pass a pointer value across the security boundary.
-
-Ultimately guaranteeing the security properties of the system is up to the programmer, but warning on types with potentially uninitialized memory is a helpful signal that the compiler can easily provide.
-
-Clang warns when union values cross the security boundary, see https://godbolt.org/z/vq9xnrnEs.
 # Drawbacks
 [drawbacks]: #drawbacks
 
@@ -192,6 +224,8 @@ For a true ergonomic experience more work is needed, but we believe this can all
 [prior-art]: #prior-art
 
 Clang and GCC support CMSE using the `__attribute__((cmse_nonsecure_entry))` and `__attribute__((cmse_nonsecure_call))` attributes. As mentioned the ABI restrictions are checked, but only late in the compilation process.
+
+The [`cortex_m`](https://docs.rs/cortex-m/latest/cortex_m/cmse/index.html) crate already provides some primitives for building cmse applications.
 
 ### Sources
 
