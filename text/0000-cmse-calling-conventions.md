@@ -241,3 +241,4 @@ The [`cortex_m`](https://docs.rs/cortex-m/latest/cortex_m/cmse/index.html) crate
 # Future possibilities
 [future-possibilities]: #future-possibilities
 
+Some ideas of future lints were discussed. For instance, an entry function that accepts a reference may set users up for failure.  The secure application (which defines the entry function) must consider the non-secure application to be hostile. Because the non-secure application can configure signal handlers that mutate arbitrary memory, there is a risk of time-of-check-time-of-use attacks. Assuming the strong guarantees of a reference might give a false sense of security.
