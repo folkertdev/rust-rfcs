@@ -99,9 +99,9 @@ Currently both ABIs disallow the use of c-variadics. For `cmse-nonsecure-entry` 
 - but accepts c-variadic nonsecure calls: https://godbolt.org/z/5rdK58ar4
 
 For `cmse-nonsecure-call` we may stabilize c-variadics at some point in the future.
-### Warn on unions and niches
+### Warn on unions crossing the secure boundary
 
-Uninitialized memory, such as space not used by the current enum or union variant, or niches in other values, can contain secret information. A warning is emitted when such values cross the security boundary (move from secure to non-secure).
+Unions can contain uninitialized memory, and this uninitialized memory can contain stale secure information. Clang warns when union values cross the security boundary (see https://godbolt.org/z/vq9xnrnEs), and rust does the same.
 
 ```
 warning: passing a union across the security boundary may leak information
@@ -113,15 +113,14 @@ LL |     f4: extern "cmse-nonsecure-call" fn(MaybeUninit<u64>),
    = note: the bytes not used by the current variant may contain stale secure data
 ```
 
-A `cmse-nonsecure-call` function will emit a warning when any of its arguments contains a union or niche, and a `cmse-nonsecure-entry` function warns when it returns a type containing a union or niche.
+Like clang, the lint is emitted at the use site. That means that in the case where passing such a value is deliberate, each use site can be annotated with `#[allow(cmse_uninitialized_leak)]`.
 
-Even passing a reference emits a warning, because it contains a niche. In practice this is unlikely to come up: the receiving side should validate the address they get anyway, so it would be better to pass a pointer value across the security boundary.
+A `cmse-nonsecure-call` function call will emit a warning when any of its arguments is or contains a union, and a `cmse-nonsecure-entry` function warns at any (implicit) return when the return type is or contains a union.
 
-Ultimately guaranteeing the security properties of the system is up to the programmer, but warning on types with potentially uninitialized memory is a helpful signal that the compiler can easily provide.
+There are other types that may contain uninitialized memory, for instance in padding bytes or in niches. Currently passing such types does not emit a warning because there is no straightforward way in the compiler to check whether a type may be (partially) uninitialized. We are of course free to extend this lint in the future when emitting the lint correctly in more cases becomes feasible.
 
-Clang warns when union values cross the security boundary, see https://godbolt.org/z/vq9xnrnEs.
-
-## Background
+Ultimately guaranteeing the security properties of the system is up to the programmer, but warning on types with potentially uninitialized memory is a helpful signal that the compiler can provide.
+## Background 
 
 Additional background on what these calling conventions do, and how they are meant to be used. This information is not strictly required to understand the RFC, but has informed the design and may explain certain design choices.
 
