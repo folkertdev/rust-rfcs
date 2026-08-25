@@ -369,7 +369,7 @@ alias based on the target triple, which does not match the `long double` used by
 
 As a concrete example:
 
-- RHEL8 (based on Fedorea 28) uses the default IBM f128
+- RHEL prior to RHEL9 uses the default IBM f128 (RHEL8 is based on Fedora 28)
 - Fedora 44 and Ubuntu 26.04 configure IEEE f128
 
 These today use the same target tuple, but are not actually ABI-compatible. It is impossible for `rustup` to download a pre-built `core` that is correct in both cases.
