@@ -319,14 +319,14 @@ Everyone's favorite thing to talk about, no technical knowledge required. And bo
 
 - `f80x87`, consistent with the recent `f16b`
 - `f80`, rejected because it suggests this is a first-class type like f32 and f128, it is not
-- `__float80`, similar to `__m256i` and similar platform-specific types in stdarch
+- `__float80`, also used in GCC/Clang, similar to `__m256i` and similar platform-specific types in stdarch
 - `x86f80` or `x86_f80` or `X86F80`
 - `x87f80` or `x87_f80` or `X87F80`
 
 **IBM F128**
 
 - `f128ppc`, consistent with the recent `f16b`
-- `__ibm128`, similar to `__m256i` and similar platform-specific types in stdarch
+- `__ibm128`, also used in GCC/Clang, similar to `__m256i` and similar platform-specific types in stdarch
 - `ppcf128` or `ppc_f128`
 - `ibmf128` or `ibm_f128`
 - `doubledouble` or `DoubleDouble`
