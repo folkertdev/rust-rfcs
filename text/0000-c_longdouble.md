@@ -396,8 +396,8 @@ Some m68k targets use a variant of `f80` that stores the same bits, but layed ou
 # History
 
 - RFC 3456 ["add `bf16`, `f64f64` and `f80 types"](https://github.com/rust-lang/rfcs/pull/3456)
-- [#t-libs > &#96;f80&#96;, &#96;f128&#96; and &#96;c_longdouble&#96;](#narrow/channel/219381-t-libs/topic/.60f80.60.2C.20.60f128.60.20and.20.60c_longdouble.60)
-- [#t-compiler > &#96;x87_f80&#96; is weird](#narrow/channel/131828-t-compiler/topic/.60x87_f80.60.20is.20weird)
+- [#t-libs > &#96;f80&#96;, &#96;f128&#96; and &#96;c_longdouble&#96;](https://rust-lang.zulipchat.com/#narrow/channel/219381-t-libs/topic/.60f80.60.2C.20.60f128.60.20and.20.60c_longdouble.60)
+- [#t-compiler > &#96;x87_f80&#96; is weird](https://rust-lang.zulipchat.com/#narrow/channel/131828-t-compiler/topic/.60x87_f80.60.20is.20weird)
 
 # Notes
 [notes]: #notes
